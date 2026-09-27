@@ -169,13 +169,21 @@ func (p *Proxy) sessionSnapshotN(info *reqInfo) int64 {
 		return 0
 	}
 
-	// A snapshot taken from a longer conversation cannot be a prefix of a
-	// shorter request, so restoring it would only force a full recompute — and
-	// because it probes deeper than the seed it would win the comparison and
-	// shadow the seed, which is still perfectly valid. Skip it here, before
-	// pulling the file back. The snapshot itself is kept: the client may return
-	// with the longer prompt.
-	if savedMsgs > 0 && info.NMsgs < savedMsgs {
+	// A snapshot is always written AFTER a response, so the state it holds is
+	// prompt + generated tokens — strictly deeper than the conversation that
+	// produced it. It can therefore only be a prefix of a request that has
+	// MORE messages, i.e. one that appended something.
+	//
+	// Equal message count means the client re-sent the conversation it already
+	// sent; the re-sent prompt is exactly the snapshot's prompt, so the
+	// snapshot overshoots by its generated tokens. Restoring it would only
+	// force a full recompute — and because it probes deeper than the seed it
+	// would win the depth comparison and shadow the seed, which is still
+	// perfectly valid. Fewer messages is the same argument, only more so.
+	//
+	// Skip in both cases, here, before pulling the file back. The snapshot is
+	// kept: the client may return with a longer prompt.
+	if savedMsgs > 0 && info.NMsgs <= savedMsgs {
 		if p.cfg.Verbose {
 			log.Printf("INFO snapshot skipped session=%s (saved with %d msgs, request has %d)",
 				info.Session, savedMsgs, info.NMsgs)

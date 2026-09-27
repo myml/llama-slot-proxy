@@ -113,6 +113,42 @@ Two practical notes:
   rollback capability of their own — that is what the server's in-process
   checkpoints are for, which is another reason not to disturb them (§3).
 
+### 5.0 The test: message count must be **strictly greater**
+
+A snapshot is written *after* a response, so the state it holds is `prompt + generated tokens` —
+**strictly deeper than the conversation that produced it**. That yields a clean test:
+
+| request messages vs snapshot | can it be a prefix | action |
+|---|---|---|
+| **strictly more** (something appended) | yes ✅ | try the restore |
+| **equal** (the same conversation re-sent) | **no** ❌ | skip, use the seed |
+| fewer | no ❌ | skip, use the seed |
+
+Why "equal" cannot work: the request's message sequence is exactly the one that produced the
+snapshot, so the request's prompt is exactly the snapshot's prompt part, while the snapshot also
+holds **its own** generated tokens ⇒ the snapshot overshoots the end of the request. (Even if the
+client merely lengthened the last message, the snapshot's trailing end-of-turn tokens do not match
+the continued content, so it still fails.)
+
+⚠️ **This test was originally written as "skip only when fewer" (`<`), which missed "equal".** The
+consequence: on **retry / regenerate**, and when reusing one session id for a new conversation at
+exactly the same message count, the proxy restored a snapshot that was bound to fail ⇒ a full
+recompute, while the seed that would have worked was kept out by the depth comparison.
+
+**Measured (same test scenario)**: with a dirty cache, `sess-…-b.bin` and `sess-…-c.bin` each held
+**13,808 tokens** (13,789 prompt + generated) while the request was 13,789 ⇒ after the restore
+`cache_n=0 / prompt_n=13789 / 51.7 s`. With `<=` the same condition gives
+`cache_n=8185 / prompt_n=5604 / 23.4 s` (the seed path), with the log stating it directly:
+`INFO snapshot skipped session=… (saved with 15 msgs, request has 15)`.
+
+**⇒ Lesson: the end-to-end test must include a round that starts from the previous round's leftover
+cache.** The three earlier regressions all ran after clearing the cache, so every one was 8/8; the
+fourth, without clearing, exposed this hole. Only a test starting from a dirty state covers the
+"restored a snapshot that was bound to fail" path.
+
+The normal append path is unaffected: DSH echoes the assistant reply each turn, so `M → M+2`
+(or `M+1`), and `M+2 > M` holds ⇒ the snapshot is reused as before.
+
 ### 5.1 Guarding against a stale snapshot shadowing a valid seed
 
 The candidate comparison in §2 picks the deeper of the two, but "deeper" is not

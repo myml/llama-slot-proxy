@@ -293,10 +293,14 @@ Read these before deploying.
   strict prefix of the next request. A client that truncates, summarises or rewrites earlier turns
   will simply miss the cache. That is safe (the server falls back to normal prefix matching and the
   proxy retires repeatedly-missing snapshots), but it does mean no benefit.
-* **A shorter prompt under a reused session id falls back to the seed.** If a client reuses one
-  session id for a new conversation, the old conversation's snapshot is deeper than the new request
-  and would fail the prefix test. The proxy detects this from the recorded message count and uses
-  the seed instead, so the new conversation is still fast.
+* **Re-sending the same conversation under a session id falls back to the seed.** A snapshot is
+  written *after* a response, so the state it holds is prompt + generated tokens — strictly deeper
+  than the conversation that produced it. Only a request with **strictly more messages** (something
+  was appended) can reuse it. The proxy compares the recorded message count and skips the snapshot
+  when the request does not have more messages. That covers both reusing one session id for a new
+  conversation and **retry / regenerate**, where the same conversation is re-sent at the same message
+  count while the snapshot already overshoots its end. The end-to-end regression now gives identical
+  results starting from a clean cache and from one left holding a previous run's deeper snapshots.
 * **State files are parsed for their header.** The proxy reads the first 12 bytes (magic, version,
   token count) to compare candidates without restoring them. If llama.cpp changed that on-disk
   format the proxy would treat files as absent — a graceful degradation, not a crash, but the cache
