@@ -236,6 +236,11 @@ Read these before deploying.
   truncates, summarises or rewrites earlier turns will simply miss the cache.
   That is safe (the server falls back to normal prefix matching) and the proxy
   retires repeatedly-missing snapshots, but it does mean no benefit.
+* **A shorter prompt under a reused session id falls back to the seed.** If a
+  client reuses one session id for a new conversation, the old conversation's
+  snapshot is deeper than the new prompt and would lose the prefix test. The
+  proxy detects this from the recorded message count and uses the seed instead,
+  so the new conversation still starts warm.
 * **State files are parsed for their header.** The proxy reads the first 12
   bytes (magic, version, token count) to compare candidates without restoring
   them. A change to that on-disk format in llama.cpp would make the proxy treat

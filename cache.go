@@ -140,7 +140,7 @@ func (p *Proxy) sessionSnapshotN(info *reqInfo) int64 {
 	// Check the fingerprint BEFORE pulling the file back: a snapshot can be
 	// gigabytes, and copying one only to discard it wastes that I/O every
 	// single request.
-	key, _ := p.sessionMeta(info.Session)
+	key, savedMsgs := p.sessionMeta(info.Session)
 	if key == "" || key != info.Key {
 		// Only complain when there really was a snapshot to discard: a brand new
 		// session legitimately has no sidecar yet.
@@ -165,6 +165,20 @@ func (p *Proxy) sessionSnapshotN(info *reqInfo) int64 {
 				reason = "no sidecar"
 			}
 			log.Printf("INFO dropped snapshot session=%s (%s)", info.Session, reason)
+		}
+		return 0
+	}
+
+	// A snapshot taken from a longer conversation cannot be a prefix of a
+	// shorter request, so restoring it would only force a full recompute — and
+	// because it probes deeper than the seed it would win the comparison and
+	// shadow the seed, which is still perfectly valid. Skip it here, before
+	// pulling the file back. The snapshot itself is kept: the client may return
+	// with the longer prompt.
+	if savedMsgs > 0 && info.NMsgs < savedMsgs {
+		if p.cfg.Verbose {
+			log.Printf("INFO snapshot skipped session=%s (saved with %d msgs, request has %d)",
+				info.Session, savedMsgs, info.NMsgs)
 		}
 		return 0
 	}

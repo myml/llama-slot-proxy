@@ -111,6 +111,29 @@ Two practical notes:
   rollback capability of their own — that is what the server's in-process
   checkpoints are for, which is another reason not to disturb them (§3).
 
+### 5.1 Guarding against a stale snapshot shadowing a valid seed
+
+The candidate comparison in §2 picks the deeper of the two, but "deeper" is not
+the same as "usable". If a client reuses one session id for a new conversation —
+or simply restarts one — the previous conversation's snapshot is much deeper
+than the new prompt, wins the comparison, and then fails the prefix test. The
+result is a full recompute, and the seed that would have worked is never tried.
+
+An earlier version of this proxy did exactly that: re-sending a 15-message
+prompt under a session whose snapshot held 19 messages cost a 52-second full
+recompute, while every log line said the restore had succeeded.
+
+This is decidable without tokenizing anything, because the sidecar already
+records how many messages the conversation had when the snapshot was written. A
+snapshot taken from a longer conversation cannot be a prefix of a shorter
+request, so it is skipped — and the file is *kept*, because the client may
+return with the longer prompt.
+
+| same session, 19-message snapshot, 15-message request | tokens prefilled | wall |
+|---|---|---|
+| without the guard | 13,789 (full recompute) | 52 s |
+| with the guard | 5,604 (seed used) | 23 s |
+
 ## 6. Save policy: content growth, not time
 
 State files are large. Restoring a 640 MB file takes ~0.13 s, and saving one
