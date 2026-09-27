@@ -121,6 +121,7 @@ func main() {
 		client:   &http.Client{Timeout: 0}, // no timeout: generations are long
 		mu:       make(chan struct{}, 1),
 		rec:      newRecorder(),
+		started:  time.Now(),
 		expect:   map[string]int64{},
 		badHits:  map[string]int{},
 		savedTok: map[string]int64{},
@@ -142,6 +143,12 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", p.handle)
+
+	if !cfg.DryRun {
+		// Learn which model the server is running: a state file records only
+		// the architecture, so the cache key has to carry the rest.
+		go p.modelWatch()
+	}
 
 	srv := &http.Server{
 		Addr:    cfg.Listen,
@@ -220,6 +227,13 @@ type Proxy struct {
 	savedTok map[string]int64
 	savedMsg map[string]int
 	msgCount map[string]int
+
+	// Model identity, folded into every cache key (see model.go).
+	modelMu      sync.Mutex
+	modelIDStr   string
+	modelDescStr string
+
+	started time.Time
 }
 
 type reqInfo struct {
@@ -246,6 +260,11 @@ func (p *Proxy) unlock() { p.mu <- struct{}{} }
 
 func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+
+	if r.URL.Path == "/stats" {
+		p.handleStats(w, r)
+		return
+	}
 
 	// Only /v1/chat/completions is eligible for caching. Everything else
 	// (health, props, models, tokenize, embeddings, ...) is a plain passthrough.
@@ -278,6 +297,7 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 		log.Printf("INFO aux request skipped session=%s msgs=%d sys_bytes=%d stream=%v",
 			info.Session, info.NMsgs, len(info.System), info.Stream)
 		p.forgetSlot() // an untracked request may have overwritten the slot
+		p.rec.count("aux")
 		p.passthrough(w, r, start, body)
 		return
 	}
@@ -285,6 +305,12 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 	// Degrade D: lock timeout -> forward without touching the cache.
 	if !p.lock(p.cfg.LockWait) {
 		log.Printf("WARN lock timeout session=%s action=passthrough", info.Session)
+		p.rec.count("lock_timeout")
+		// This request is about to overwrite the slot without us capturing it,
+		// so the recorded owner no longer describes what is resident. Keeping
+		// the stale claim would make the owner's next request look "resident",
+		// skipping the snapshot restore that would actually have worked.
+		p.forgetSlot()
 		p.passthrough(w, r, start, body)
 		return
 	}
@@ -353,9 +379,15 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 	// --- forward (never rewritten) ---
 	up := p.forward(w, r, body, start)
 
+	// Degrade E already answered the client; there is nothing to record.
+	if up == nil {
+		p.rec.count("upstream_error")
+		return
+	}
+
 	// --- record who owns the slot now (for the continuity fast path) ---
-	if up != nil {
-		p.noteReuse(info.Session, up.cacheN)
+	p.noteReuse(info.Session, up.cacheN)
+	{
 		p.claimSlot(info.Session, info.Key)
 		p.noteMsgs(info.Session, info.NMsgs)
 		// Stamp the fingerprint now, not only on save: a session that stays
@@ -419,9 +451,15 @@ func (p *Proxy) parseRequest(r *http.Request, body []byte) (*reqInfo, error) {
 
 	sys := rawToString(doc.Messages[0].Content)
 
-	// The key must cover system AND tools: tools render inside the system
-	// message, so a change in tools changes the rendered prefix.
+	// The key must cover the MODEL, the system message and the tools.
+	// - tools render inside the system message, so they change the prefix;
+	// - the model identity is not recorded in a state file at all (llama.cpp
+	//   stores only the architecture name), so without it a restart on a
+	//   different same-architecture model would silently reuse the old KV.
+	// See model.go.
 	h := sha256.New()
+	h.Write([]byte(p.modelID()))
+	h.Write([]byte{0})
 	h.Write([]byte(sys))
 	h.Write([]byte{0})
 	h.Write(bytes.TrimSpace(doc.Tools))
@@ -548,9 +586,26 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, sta
 	// Tee so we can read `timings` out of the tail without buffering the whole
 	// stream. Keeps a bounded tail only.
 	tail := &tailBuffer{max: 256 << 10}
-	_, _ = io.Copy(io.MultiWriter(w, tail), resp.Body)
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
+	flusher, _ := w.(http.Flusher)
+
+	// Copy by hand and flush every chunk. A streaming reply arrives as many
+	// small SSE events; with a single io.Copy they sit in Go's ~2 KB response
+	// buffer until it fills, which delays the first tokens the client sees.
+	buf := make([]byte, 32<<10)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				break // client went away
+			}
+			_, _ = tail.Write(buf[:n])
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if rerr != nil {
+			break
+		}
 	}
 	return &upResult{cacheN: tail.cacheN(), promptN: tail.promptN()}
 }

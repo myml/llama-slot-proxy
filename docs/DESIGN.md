@@ -190,7 +190,85 @@ u32 n_token_count
 后面跟着 token 数组和序列化状态。只用到第三个字段（以及文件大小，见第 9 节）。
 头部截断或读不出来时，一律当作「没有快照」，而绝不当作错误 —— 请求照样通过。
 
-## 11. 刻意不做的事
+## 11. 模型身份：状态文件里没有它
+
+缓存键是 `sha256(模型指纹 + system + tools)[:16]`。前两项的历史值得记下来，因为缺了模型指纹
+是一类**静默错误答案**的 bug，而不是性能问题。
+
+llama.cpp 写状态文件时只写了**架构名**（`src/llama-context.cpp`，`state_write_data`）：
+
+```cpp
+const std::string arch_str = llm_arch_name(model.arch);
+io.write_string(arch_str);
+// TODO: add more model-specific info which should prevent loading the session file if not identical
+```
+
+读取侧同样只比对架构名，而且**上游在两侧各留了一条 TODO**：
+
+```cpp
+if (cur_arch_str != arch_str) {
+    throw std::runtime_error(format("wrong model arch: '%s' instead of '%s'", ...));
+}
+// TODO: add more info which needs to be identical but which is not verified otherwise
+```
+
+唯一被校验的是**文件格式版本**（`LLAMA_STATE_SEQ_VERSION`，读取处比对 magic 与 version）：
+
+```cpp
+if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) { ... }
+```
+
+⇒ 结论有两面：
+
+* **升级 llama.cpp 是安全的** —— 格式变了版本号会不匹配，恢复会干净地失败，代理按 miss 处理。
+* **换模型不安全**：同架构、同尺寸、不同权重（另一个量化，或另一个微调）时，`n_embd`/`n_layer`
+  等形状全部一致，状态会被**无错加载**，于是上一个模型的 KV 被用来给这个模型作答。答案错，
+  但没有任何报错。这个部署正好会踩到：模型目录里有多个同族 GGUF。
+
+修法沿用已有的内容寻址：指纹取自 `/props` 的 `model_path` 与 `model_ftype`，再加上代理自己
+`stat` 到的模型文件大小与 mtime（mtime 用于捕捉「原地重新量化」）。文件不可见时退化为只用
+`/props` 的字段。指纹一变，所有缓存条目自动改名，旧条目成为无人引用的垃圾，由既有的淘汰逻辑
+清掉 —— **不需要任何手动清理或失效通知**。
+
+指纹每 60 秒复核一次，因此换模型后无需重启代理；复核失败（上游还没起来）只记一条 WARN，
+期间的键不含模型指纹，恢复正常后自动收敛。
+
+## 12. 转发必须逐块 flush
+
+`forward()` 手工拷贝响应体并在**每个 chunk 之后** `Flush()`。最初用的是一次 `io.Copy`
+加末尾一次 flush，那会让流式形同虚设 —— 数据要等 Go 的响应缓冲凑满才会下发，
+而缓冲一旦在响应结束前都没满，就会在处理器返回时一次性吐出。
+
+用一个每 200 ms 发一个 SSE 事件的假上游量过（完全绕开模型，只测代理的转发路径）：
+
+| 响应规模 | 直连上游 | 一次 io.Copy（旧） | 逐块 flush（现） |
+|---|---|---|---|
+| 21 块 ≈ 2 KB | 首块 **0.006 s** | 首块 **4.013 s**（全部挤在最后） | 首块 **0.006 s** |
+| 201 块 ≈ 90 KB | 首块 0.005 s，最大间隔 0.011 s | 首块 **0.097 s**，最大间隔 **0.103 s**，卡顿 21 次 | 首块 0.006 s，最大间隔 0.012 s，卡顿 0 次 |
+
+第一行是「短回答完全没有流式」：总量不到 2 KB，缓冲区直到结束都没满。第二行是真实规模下
+约 90 ms 的额外首字延迟，以及每约 2 KB 一次的可见停顿。
+
+## 13. 槽位归属会在两条路径上失效
+
+「已常驻 ⇒ 直接转发」是收益最高的判定，因此它出错时代价也最大：会**跳过本来能命中的恢复**。
+两处都已修：
+
+**(a) 归属判定不能只看 session id。** 一次会话里混着不同形状的请求：DSH 会发标题生成请求，
+opencode 先发一个 2 KB system 的标题请求再发真正那个。它们共用 session id，但 system 与 tools
+不同，因此槽里那份状态**并不持有这个请求的前缀**。修法：`slotHolds()` 无条件比对
+`slotKey`（system+tools 指纹），不再是「session 相同就算常驻」。实测（opencode，冷槽）：
+标题请求占槽后，主请求被判 `resident` ⇒ `cache_n=0 / prompt_n=7448 / 全量 36 s`。
+
+**(b) 锁超时旁路必须清掉归属。** 旁路请求会覆盖槽位，但当时没有调用 `forgetSlot()`
+（辅助请求那条路径是有的）。于是 `slotOwner`/`slotKey` 还在描述上一个会话，而槽里已经是别人的
+状态 ⇒ 该会话下一次请求被判「常驻」⇒ 跳过快照恢复、白白全量重算。修法：旁路前 `forgetSlot()`。
+
+**(c) 上游不可达时不能空指针。** `forward()` 失败会返回 nil，而记录处直接取了
+`up.cacheN` ⇒ panic。客户端拿到的不是 502 而是连接被重置（实测 `HTTP=000`）。
+修法：nil 提前返回并计入 `upstream_errors`。
+
+## 14. 刻意不做的事
 
 * **不改写请求。** 代理先恢复，然后把请求体原样转发。
   正因如此，缓存失败只是一次性能事件，而不是一次正确性事件。

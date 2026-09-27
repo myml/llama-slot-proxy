@@ -171,6 +171,26 @@ make build          # or: go build -o llama-slot-proxy .
 
 Requires Go 1.21+. There are no dependencies outside the standard library.
 
+## Monitoring
+
+`GET /stats` returns a JSON snapshot, so you do not have to grep the log:
+
+```json
+{
+  "uptime_s": 3600,
+  "model":    {"fingerprint": "873c7044e5564439", "description": "...FAST.gguf [Q4_0_ROCMFP4_FAST] 14562236384 bytes"},
+  "slot":     {"owner": "session-...", "tokens": 13789},
+  "requests": {"cached": 2, "resident": 0, "session_hit": 1, "seed_hit": 1, "seed_miss": 0,
+               "aux_skipped": 0, "lock_timeouts": 0, "upstream_errors": 0},
+  "tokens":   {"reused": 22441, "recomputed": 6216, "reuse_ratio": 0.783},
+  "cache":    {"dir": "/dev/shm/proxy-cache", "bytes": 2393333737, "files": 7,
+               "limit_bytes": 5368709120, "durable_bytes": 1733605170, "durable_files": 5}
+}
+```
+
+`tokens.reuse_ratio` is the number to watch: how much of what would have been recomputed was
+actually reused. The degradation counters (`lock_timeouts`, `upstream_errors`) should stay at 0.
+
 ## Flags
 
 | Flag | Default | Meaning |
@@ -290,6 +310,19 @@ Read these before deploying.
   snapshot that poisons the real conversation on the next turn. The default filters them out.
 * **One slot.** With `-np 1` a restore overwrites the resident state; the proxy serializes
   accordingly. Multiple slots are not modeled.
+* **The cache key includes a model fingerprint.** A llama.cpp state file records only the
+  *architecture* name, and the read side compares nothing else — upstream carries a
+  `TODO: add more model-specific info which should prevent loading the session file if not identical`
+  on both the write and the read side. So after a switch to a **same-architecture, same-dimension,
+  different-weights** GGUF the old state loads without error and the previous model's KV is used to
+  answer: a silent wrong answer, not a crash. The proxy therefore folds `/props`'s `model_path` and
+  `model_ftype`, plus the model file's size and mtime, into the key. A model change renames every
+  cache entry and the old ones become unreferenced garbage collected by the existing eviction —
+  **no manual cleanup**. (The state *format* version is checked by llama.cpp itself, see
+  `LLAMA_STATE_SEQ_VERSION`, so upgrading llama.cpp is safe.)
+* **Streaming responses are flushed per chunk.** Each SSE event is forwarded as soon as it arrives.
+  This matters most for short answers: buffered, a stream under 2 KB reaches the client in one piece
+  only after the whole response has finished.
 * **The proxy is about speed, not correctness.** If every cache operation fails it forwards the
   request unchanged. There is no path where a cache failure changes a response.
 
@@ -314,6 +347,8 @@ not restore, in order not to throw away the server's in-process checkpoints.
 main.go      request handling, decision order, forwarding, config
 cache.go     seeds, session snapshots, save policy, pruning, slot API client
 persist.go   tmpfs work dir + durable copy, eviction, lazy pull-back
+model.go     model identity fingerprint (folded into the cache key)
+stats.go     the /stats endpoint
 docs/DESIGN.en.md   the mechanisms behind the rules, with measurements
 ```
 

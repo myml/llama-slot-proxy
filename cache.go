@@ -543,7 +543,15 @@ type recorder struct {
 	mu       sync.Mutex
 	rows     int64
 	hitSess  int64
+	hitSeed  int64
 	missSeed int64
+	resident int64
+	auxSkip  int64
+	lockTO   int64
+	upErr    int64
+	cacheN   int64
+	promptN  int64
+	durMS    int64
 	f        *os.File
 }
 
@@ -553,17 +561,56 @@ func (r *recorder) add(e rec) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.rows++
-	if e.Sess == "hit" {
+	switch e.Sess {
+	case "hit":
 		r.hitSess++
+	case "resident":
+		r.resident++
 	}
-	if e.Seed == "miss" {
+	switch e.Seed {
+	case "hit":
+		r.hitSeed++
+	case "miss":
 		r.missSeed++
 	}
+	r.cacheN += e.CacheN
+	r.promptN += e.PromptN
+	r.durMS += e.DurMS
 	if e.TS == "" {
 		e.TS = time.Now().Format(time.RFC3339)
 	}
 	b, _ := json.Marshal(e)
 	log.Printf("STATS rows=%d sess_hit=%d seed_miss=%d %s", r.rows, r.hitSess, r.missSeed, b)
+}
+
+// count records a request that never reached the cache phases.
+func (r *recorder) count(kind string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch kind {
+	case "aux":
+		r.auxSkip++
+	case "lock_timeout":
+		r.lockTO++
+	case "upstream_error":
+		r.upErr++
+	}
+}
+
+// stats is a point-in-time copy of the counters.
+type stats struct {
+	rows, hitSess, hitSeed, missSeed, resident, auxSkip, lockTO, upErr int64
+	cacheN, promptN, durMS                                             int64
+}
+
+func (r *recorder) snapshot() stats {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return stats{
+		rows: r.rows, hitSess: r.hitSess, hitSeed: r.hitSeed, missSeed: r.missSeed,
+		resident: r.resident, auxSkip: r.auxSkip, lockTO: r.lockTO, upErr: r.upErr,
+		cacheN: r.cacheN, promptN: r.promptN, durMS: r.durMS,
+	}
 }
 
 // ---------------------------------------------------------------- slot state

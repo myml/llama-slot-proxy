@@ -154,6 +154,26 @@ make build          # 或者：go build -o llama-slot-proxy .
 
 需要 Go 1.21+。除标准库外没有任何依赖。
 
+## 监控
+
+`GET /stats` 返回一个 JSON 快照，不必再去 grep 日志：
+
+```json
+{
+  "uptime_s": 3600,
+  "model":    {"fingerprint": "873c7044e5564439", "description": "...FAST.gguf [Q4_0_ROCMFP4_FAST] 14562236384 bytes"},
+  "slot":     {"owner": "session-...", "tokens": 13789},
+  "requests": {"cached": 2, "resident": 0, "session_hit": 1, "seed_hit": 1, "seed_miss": 0,
+               "aux_skipped": 0, "lock_timeouts": 0, "upstream_errors": 0},
+  "tokens":   {"reused": 22441, "recomputed": 6216, "reuse_ratio": 0.783},
+  "cache":    {"dir": "/dev/shm/proxy-cache", "bytes": 2393333737, "files": 7,
+               "limit_bytes": 5368709120, "durable_bytes": 1733605170, "durable_files": 5}
+}
+```
+
+`tokens.reuse_ratio` 是最值得盯的一个数：本来需要重算、实际被复用的比例。
+`requests` 里那几个降级计数（`lock_timeouts`、`upstream_errors`）在正常情况下应该始终是 0。
+
 ## 命令行参数
 
 | 参数 | 默认值 | 含义 |
@@ -263,6 +283,16 @@ WantedBy=multi-user.target
   （生成标题之类）。它们很短的 system 提示词会构建一个没用的种子，并留下一个浅快照，
   下一轮污染真正的对话。默认值会把它们过滤掉。
 * **单槽位。** 在 `-np 1` 下恢复会覆盖常驻状态，代理据此串行化。多槽位未被建模。
+* **缓存键里包含模型指纹。** llama.cpp 的状态文件只记录**架构名**，读取时也只比对架构名
+  —— 上游源码在写入侧和读取侧各留了一条 `TODO: add more model-specific info which should
+  prevent loading the session file if not identical`。所以换成一个**同架构、同尺寸、不同权重**的
+  GGUF 时，旧状态会被无错加载，然后**拿上一个模型的 KV 去回答**：是静默的错答案，不是崩溃。
+  代理因此把 `/props` 的 `model_path`、`model_ftype`，加上模型文件的大小与 mtime，一并折进缓存键。
+  换模型会让每个缓存条目自动改名，旧条目变成没人引用的垃圾，由既有的淘汰逻辑清掉 ——
+  **不需要手动清理**。（状态文件的格式版本号由 llama.cpp 自己校验，见
+  `LLAMA_STATE_SEQ_VERSION`，所以升级 llama.cpp 是安全的。）
+* **流式响应是逐块 flush 的。** 上游每个 SSE 事件一到就转发出去。这在短回答上差别很大：
+  若攒在响应缓冲区里，一个不到 2 KB 的流会等到整段结束才一次性到达客户端。
 * **代理只关乎速度，不关乎正确性。** 即使所有缓存操作都失败，它也会原样转发请求。
   不存在任何一条「缓存失败会改变响应内容」的路径。
 
@@ -285,6 +315,8 @@ WantedBy=multi-user.target
 main.go          请求处理、判定顺序、转发、配置
 cache.go         种子、会话快照、保存策略、淘汰、槽位 API 客户端
 persist.go       tmpfs 工作目录 + 持久副本、淘汰、按需取回
+model.go         模型身份指纹（折进缓存键）
+stats.go         /stats 端点
 docs/DESIGN.md   规则背后的机制，附实测数据
 ```
 

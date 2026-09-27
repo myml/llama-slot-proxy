@@ -221,7 +221,99 @@ followed by the token array and the serialized state. Only the third field is
 used (and the file size, §9). A truncated or unreadable header is treated as
 "no snapshot", never as an error — the request still goes through.
 
-## 11. Deliberate non-goals
+## 11. Model identity is not in the state file
+
+The cache key is `sha256(model fingerprint + system + tools)[:16]`. The history of the first
+component is worth recording, because omitting it is a **silently wrong answer** bug rather than a
+performance one.
+
+llama.cpp writes only the *architecture* name into a state file (`src/llama-context.cpp`,
+`state_write_data`):
+
+```cpp
+const std::string arch_str = llm_arch_name(model.arch);
+io.write_string(arch_str);
+// TODO: add more model-specific info which should prevent loading the session file if not identical
+```
+
+The read side compares nothing else either, and **upstream carries a TODO on both sides**:
+
+```cpp
+if (cur_arch_str != arch_str) {
+    throw std::runtime_error(format("wrong model arch: '%s' instead of '%s'", ...));
+}
+// TODO: add more info which needs to be identical but which is not verified otherwise
+```
+
+The only thing actually validated is the **file-format version** (`LLAMA_STATE_SEQ_VERSION`, checked
+against magic and version on read):
+
+```cpp
+if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) { ... }
+```
+
+So there are two sides to this:
+
+* **Upgrading llama.cpp is safe** — a changed format bumps the version, the restore fails cleanly and
+  the proxy treats it as a miss.
+* **Changing the model is not**: with the same architecture, the same dimensions and different
+  weights (another quantisation, another fine-tune) every shape matches, the state loads without
+  error, and the previous model's KV answers for the new one. Wrong answers, no error. This
+  deployment walks straight into it: the model directory holds several GGUFs from the same family.
+
+The fix reuses the existing content addressing: the fingerprint is `/props`'s `model_path` and
+`model_ftype` plus the model file's size and mtime as seen by the proxy (mtime catches an in-place
+re-quantisation). When the file is not visible the `/props` fields alone are used. A fingerprint
+change renames every cache entry; the old ones become unreferenced garbage collected by the existing
+eviction — **no manual cleanup and no invalidation notification**.
+
+The fingerprint is re-checked every 60 seconds, so a model swap needs no proxy restart. A failed
+re-check (the server is not up yet) logs one WARN; keys omit the fingerprint until it succeeds, then
+converge on their own.
+
+## 12. Forwarding must flush per chunk
+
+`forward()` copies the response body by hand and calls `Flush()` after **every chunk**. The original
+single `io.Copy` plus one trailing flush made streaming useless: data waited for Go's response
+buffer to fill, and if it never filled before the response ended, everything was emitted at once
+when the handler returned.
+
+Measured against a fake upstream emitting one SSE event every 200 ms — the model is out of the
+picture, so this isolates the proxy's forwarding path:
+
+| Response size | Direct to upstream | One io.Copy (old) | Per-chunk flush (now) |
+|---|---|---|---|
+| 21 chunks ≈ 2 KB | first **0.006 s** | first **4.013 s** (all at the end) | first **0.006 s** |
+| 201 chunks ≈ 90 KB | first 0.005 s, max gap 0.011 s | first **0.097 s**, max gap **0.103 s**, 21 stalls | first 0.006 s, max gap 0.012 s, 0 stalls |
+
+The first row is a short answer with no streaming at all: under 2 KB, so the buffer never filled.
+The second is roughly 90 ms of added first-token latency at a realistic size, plus a visible stall
+every ~2 KB.
+
+## 13. Slot ownership fails on two paths
+
+"Already resident ⇒ forward directly" is the highest-value decision, so it is also the most costly
+to get wrong: it **skips a restore that would have worked**. Both paths are fixed.
+
+**(a) Ownership cannot rest on the session id alone.** One session carries requests of different
+shapes: DSH sends title generation, opencode sends a 2 KB-system title request before the real one.
+They share a session id but not a system prompt or tool set, so the state in the slot does **not**
+hold this request's prefix. Fix: `slotHolds()` compares `slotKey` (the system+tools fingerprint)
+unconditionally instead of treating "same session" as resident. Measured with opencode against a
+cold slot: the title request claimed the slot, the main request was judged `resident` ⇒
+`cache_n=0 / prompt_n=7448 / a full 36 s`.
+
+**(b) The lock-timeout bypass must forget the owner.** A bypassing request overwrites the slot, but
+`forgetSlot()` was not called there (the auxiliary path does call it). `slotOwner`/`slotKey` then
+still described the previous session while the slot held someone else's state ⇒ that session's next
+request looked "resident" ⇒ its snapshot restore was skipped and everything was recomputed. Fix:
+`forgetSlot()` before bypassing.
+
+**(c) An unreachable upstream must not dereference nil.** `forward()` returns nil on failure and the
+recording code read `up.cacheN` directly ⇒ panic. The client got a reset connection rather than a
+502 (measured `HTTP=000`). Fix: return early on nil and count it in `upstream_errors`.
+
+## 14. Deliberate non-goals
 
 * **No request rewriting.** The proxy restores and then forwards the body
   untouched. This is what makes a cache failure a performance event rather than
