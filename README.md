@@ -1,113 +1,101 @@
 # llama-slot-proxy
 
-A small, dependency-free Go proxy that sits in front of
-[llama-server](https://github.com/ggml-org/llama.cpp) and makes its prompt cache
-reusable **across new sessions** and **across server restarts**.
+[English](README.en.md) | **中文**
 
-It does this by driving llama.cpp's own `--slot-save-path` / slot save+restore
-API. The proxy never touches the KV cache itself and never rewrites your
-requests — it only asks the server to restore a previously saved state before
-forwarding.
+一个零依赖的 Go 代理，架在 [llama-server](https://github.com/ggml-org/llama.cpp) 前面，
+让它的提示缓存能够**跨新会话复用**、并且**在服务重启后依然可用**。
+
+实现方式是驱动 llama.cpp 自带的 `--slot-save-path` 与槽位 save/restore 接口。
+代理本身不碰 KV 缓存，也不改写你的请求 —— 它只是在转发之前，请服务端恢复一份此前保存的状态。
 
 ```
-client ──► llama-slot-proxy :8080 ──► llama-server :8081
+客户端 ──► llama-slot-proxy :8080 ──► llama-server :8081
                     │
-                    └── shares the state directory with --slot-save-path
+                    └── 与 --slot-save-path 共用同一个状态目录
 ```
 
 ---
 
-## The problem
+## 要解决的问题
 
-Agent clients resend the whole conversation on every turn: a long system
-prompt, the full tool schema, and the entire history. llama-server already
-reuses a matching prefix from its slot, so *continuing* a conversation is
-cheap. What is expensive is everything else:
+Agent 类客户端每一轮都会重发整段对话：很长的 system 提示词、完整的工具定义、以及全部历史。
+llama-server 本来就能复用槽位里匹配的前缀，所以**延续**一段对话很便宜。贵的是其它情况：
 
-| Situation | What llama-server does on its own |
+| 情况 | llama-server 自己会怎么做 |
 |---|---|
-| **New session**, same system prompt | prefills the whole shared prefix again |
-| **Switching between sessions** | the other session's state was evicted |
-| **After a server restart** | the slot is empty again |
+| **新会话**，system 提示词相同 | 把整段共享前缀重新预填充一遍 |
+| **在两个会话之间切换** | 另一个会话的状态已被挤掉了 |
+| **服务重启之后** | 槽位又空了 |
 
-With a ~36 KB agent system prompt that means re-processing thousands of tokens
-every time a new conversation starts, and re-processing the *entire* history if
-a long session's state is lost.
+对于一份约 36 KB 的 agent system 提示词，这意味着每开一个新对话都要重算几千个 token；
+而如果一段长会话的状态丢了，则要重算**整段历史**。
 
-## What this proxy does
+## 这个代理做了什么
 
-Two kinds of state are cached, both as ordinary llama.cpp state files:
+缓存两种状态，都是 llama.cpp 原生的状态文件：
 
-* **Seed** — the state after pre-encoding just the system message (+ tool
-  schema), and nothing else. It is a strict prefix of *every* conversation that
-  shares that system prompt, so it is valid for all of them, and it is keyed by
-  a hash of `system + tools` so a changed system prompt simply produces a
-  different seed.
-* **Session snapshot** — the state at the end of a particular conversation.
-  Valid only for that conversation, because a later turn is a superset of an
-  earlier one.
+* **种子（seed）** —— 只预编码了 system 消息（加工具定义）之后的状态，别无其它。
+  它是**所有**共用该 system 提示词的会话的严格前缀，因此对它们全都有效；
+  并且以 `system + tools` 的哈希为键，所以 system 一变，自然就是一个新种子。
+* **会话快照（session snapshot）** —— 某一段具体对话末尾的状态。
+  只对该对话有效，因为同一对话的后续轮次是它的超集。
 
-On each request the proxy decides, from cheapest to most expensive:
+每个请求按「从便宜到昂贵」的顺序判断：
 
-1. **Auxiliary request?** (tiny system prompt, e.g. title generation) → plain
-   passthrough, never touch the cache.
-2. **Is this session already the resident one?** → forward, no restore at all.
-   llama-server's own prefix matching handles the continuation.
-3. **A session snapshot exists and is deeper than the seed?** → restore it.
-4. **A seed exists?** → restore it.
-5. **Nothing yet?** → build the seed (one prefill), then forward.
+1. **是辅助请求吗？**（system 很短，例如生成标题）→ 纯透传，完全不碰缓存。
+2. **这个会话的状态已经在槽位里了吗？** → 直接转发，不做任何 restore。
+   后续交给 llama-server 自己的前缀匹配。
+3. **存在本会话快照、且比种子更深吗？** → 恢复它。
+4. **存在种子吗？** → 恢复种子。
+5. **都还没有？** → 构建种子（一次预填充），然后转发。
 
-## Measured results
+## 实测数据
 
-On the development machine (Ryzen AI MAX+ 395, Radeon 8060S, 61 GiB unified
-memory; Qwen3-class 27B hybrid model, 4-bit weights, `q8_0` KV, 256K context,
-single slot), serving a real ~104K-token agent conversation:
+开发机：Ryzen AI MAX+ 395 / Radeon 8060S，61 GiB 统一内存；
+Qwen3 系 27B 混合模型，4-bit 权重，`q8_0` KV，256K 上下文，单槽位。
+以下是一段真实的约 104K token 的 agent 对话：
 
-| | tokens prefilled | wall time |
+| | 预填充 token | 墙钟耗时 |
 |---|---|---|
-| **Cold**, no cache at all | 103,928 | **608.6 s** |
-| Same conversation, next turn | 19 | **4.8 s** |
-| Same conversation, **after restarting llama-server** | 18 | **5.0 s** |
+| **冷启动**，完全无缓存 | 103,928 | **608.6 s** |
+| 同一对话的下一轮 | 19 | **4.8 s** |
+| 同一对话，**重启 llama-server 之后** | 18 | **5.0 s** |
 
-A new session sharing the system prompt, at ~13.8K tokens of context:
+新会话共用该 system 提示词、上下文约 13.8K token 时：
 
-| | tokens prefilled | wall time |
+| | 预填充 token | 墙钟耗时 |
 |---|---|---|
-| No cache | 13,789 | 52.8 s |
-| Seed restored | 5,604 | **22.9 s** |
+| 无缓存 | 13,789 | 52.8 s |
+| 恢复种子 | 5,604 | **22.9 s** |
 
-Restore itself is cheap: a 640 MB state file restores in ~130 ms, and on this
-machine the state size follows
+恢复本身很便宜：一份 640 MB 的状态文件约 130 ms 恢复完。本机上状态文件大小服从
 
 ```
-state_bytes ≈ 149.63 MiB + 34.0 KiB × n_tokens
+状态字节数 ≈ 149.63 MiB + 34.0 KiB × n_tokens
 ```
 
-so a full 256K context is roughly 8.65 GiB per state file. Plan your `-max-bytes`
-accordingly.
+所以满 256K 上下文时每份状态文件约 8.65 GiB。请据此规划 `-max-bytes`。
 
-## Requirements
+## 前置条件
 
-* A llama.cpp build with the `--slot-save-path` server option and the
-  `/slots?action=save|restore` endpoints (present in upstream for a long time).
-* **llama-server must write to the same directory the proxy reads.** The proxy
-  passes only a *filename* to the server, which resolves it relative to its own
-  `--slot-save-path`. So `-cache-dir` must be the same path on both sides —
-  same host, same mount namespace, same string.
-* One slot (`-np 1`) is assumed. The proxy serializes cache work behind a single
-  lock, because a restore overwrites whatever is resident.
-* Nothing else. No cgo, no third-party modules, no build service.
+* 一个带 `--slot-save-path` 选项、以及 `/slots?action=save|restore` 接口的 llama.cpp 构建
+  （上游早已具备）。
+* **llama-server 必须写入代理所读取的同一个目录。** 代理只把一个**文件名**交给服务端，
+  由服务端相对它自己的 `--slot-save-path` 解析。所以 `-cache-dir` 在两边必须是同一个路径 ——
+  同一台主机、同一个挂载命名空间、同一个字符串。
+* 假定单槽位（`-np 1`）。代理把缓存操作串行化在一把全局锁后面，因为恢复会覆盖槽位里现有的内容。
+* 别无其它要求。不需要 cgo、不需要第三方模块、不需要构建服务。
 
-## Quick start
+## 快速开始
 
-Start llama-server with a slot-save-path (tmpfs recommended — see below):
+启动 llama-server 时给出 slot-save-path（推荐 tmpfs，原因见下）：
 
 ```bash
 llama-server -m model.gguf -c 32768 -np 1 \
   --slot-save-path /dev/shm/llama-slot-proxy
 ```
 
-Start the proxy in front of it, and point your client at the proxy:
+在它前面启动代理，然后把客户端指向代理：
 
 ```bash
 llama-slot-proxy \
@@ -117,82 +105,72 @@ llama-slot-proxy \
   -persist-dir /var/lib/llama-slot-proxy
 ```
 
-Try it once with `-dry-run -v` first: that turns the proxy into a pure
-passthrough that still logs the `cache_n` / `prompt_n` of every upstream
-response, which is the quickest way to see what your workload would save.
+**建议先用 `-dry-run -v` 跑一次**：这时代理退化为纯透传，但仍会把每个上游响应的
+`cache_n` / `prompt_n` 记进日志 —— 这是最快看出你的负载能省多少的办法。
 
-### Build
+### 构建
 
 ```bash
-make build          # or: go build -o llama-slot-proxy .
+make build          # 或者：go build -o llama-slot-proxy .
 ```
 
-Requires Go 1.21+. There are no dependencies outside the standard library.
+需要 Go 1.21+。除标准库外没有任何依赖。
 
-## Flags
+## 命令行参数
 
-| Flag | Default | Meaning |
+| 参数 | 默认值 | 含义 |
 |---|---|---|
-| `-listen` | `0.0.0.0:8080` | Address to listen on. |
-| `-upstream` | `127.0.0.1:8081` | llama-server address. |
-| `-cache-dir` | `/dev/shm/llama-slot-proxy` | Working dir. **Must equal** llama-server's `--slot-save-path`. |
-| `-persist-dir` | `""` | Durable dir: receives a copy on exit and holds evicted snapshots. Empty = keep everything in `-cache-dir`. |
-| `-max-bytes` | 16 GiB | Cap for `-cache-dir`. |
-| `-durable-bytes` | 32 GiB | Cap for `-persist-dir`. |
-| `-max-age` | 24h | Age after which a session snapshot is discarded. |
-| `-max-seeds` | 4 | How many distinct seeds to keep. |
-| `-session-header` | `Session_id` | Request header carrying the session id. `X-Client-Request-Id` is tried as a fallback. |
-| `-min-system-bytes` | 2000 | Requests with a shorter system message are never cached (filters out auxiliary requests). 0 = cache everything. |
-| `-require-stream` | false | Also require `stream: true` to cache a request. |
-| `-save-every-tokens` | 8000 | Save a session snapshot after this much new content. 0 = save only on slot handover. |
-| `-save-every-msgs` | 10 | Save after this many new messages. 0 = disable. |
-| `-lock-wait` | 120s | Max wait for the slot lock; on timeout the request is forwarded uncached. |
-| `-log` | `""` | Log file; empty means stderr. |
-| `-dry-run` | false | Never touch the cache (pure passthrough). |
-| `-v` | false | Verbose logging. |
+| `-listen` | `0.0.0.0:8080` | 监听地址。 |
+| `-upstream` | `127.0.0.1:8081` | llama-server 地址。 |
+| `-cache-dir` | `/dev/shm/llama-slot-proxy` | 工作目录。**必须等于** llama-server 的 `--slot-save-path`。 |
+| `-persist-dir` | `""` | 持久目录：退出时收到一份副本，被淘汰的快照也移到这里。留空则全部留在 `-cache-dir`。 |
+| `-max-bytes` | 16 GiB | `-cache-dir` 的容量上限。 |
+| `-durable-bytes` | 32 GiB | `-persist-dir` 的容量上限。 |
+| `-max-age` | 24h | 超过这个年龄的会话快照会被丢弃。 |
+| `-max-seeds` | 4 | 保留多少个不同的种子。 |
+| `-session-header` | `Session_id` | 携带会话 id 的请求头；找不到时回退尝试 `X-Client-Request-Id`。 |
+| `-min-system-bytes` | 2000 | system 消息短于该字节数的请求完全不走缓存（用来过滤辅助请求）。0 = 全都缓存。 |
+| `-require-stream` | false | 额外要求 `stream: true` 才缓存。 |
+| `-save-every-tokens` | 8000 | 内容增长到这么多 token 后保存一次会话快照。0 = 只在槽位换手时保存。 |
+| `-save-every-msgs` | 10 | 新增这么多条消息后保存一次。0 = 关闭。 |
+| `-lock-wait` | 120s | 等待槽位锁的上限；超时则不加锁直接转发。 |
+| `-log` | `""` | 日志文件；留空则写 stderr。 |
+| `-dry-run` | false | 完全不碰缓存（纯透传）。 |
+| `-v` | false | 详细日志。 |
 
-## How the save policy works
+## 保存策略是怎么定的
 
-Saving a state file is not free (hundreds of MB), so the proxy does **not** save
-on every request:
+保存一份状态文件并不便宜（几百 MB），所以代理**不会**每个请求都保存：
 
-* **Strategy A — save on handover.** When a different session is about to take
-  the slot, the outgoing session is saved first. This is the only moment its
-  state can still be captured, and it is the reason steady-state turns cause
-  **zero** disk writes.
-* **Strategy B — save on content growth.** A session that keeps the slot saves
-  once its prompt has grown by `-save-every-tokens` tokens or
-  `-save-every-msgs` messages. Growth is measured in content, never on a timer,
-  so idle time costs nothing and bursts are still captured.
-* **Retirement.** A snapshot that is restored but *not* actually reused is worse
-  than no snapshot, because the restore destroys the checkpoints llama-server
-  would otherwise have rolled back to. After two consecutive misses the
-  snapshot is dropped. Snapshots that a seed already covers are dropped as well.
+* **策略 A —— 换手时保存。** 当另一个会话即将占走槽位时，先把当前会话存下来。
+  这是它的状态还能被捕获的唯一时刻，也是稳态轮次**零磁盘写入**的原因。
+* **策略 B —— 按内容增长保存。** 一直占着槽位的会话，在提示词增长到
+  `-save-every-tokens` 个 token、或 `-save-every-msgs` 条消息时保存一次。
+  增长按**内容**计量，绝不按时间，所以空闲期不产生任何开销，突发也不会漏掉。
+* **退役。** 一个快照如果被恢复、却**没有**真正被复用，那它比没有快照更糟 ——
+  因为这次恢复毁掉了 llama-server 本来可以用来回滚的检查点。
+  连续两次未命中就把它丢掉。另外，如果一个种子已经覆盖了某个快照，也会把它丢掉。
 
-Nothing is preloaded at startup: a snapshot is pulled back from `-persist-dir`
-only when a request needs it.
+启动时**不做任何预热**：只有请求真的需要时，才从 `-persist-dir` 把快照取回。
 
-## tmpfs + durable tiering
+## tmpfs + 持久层分级
 
-State files are large and rewritten often, so writing them straight to disk is
-slow and write-amplifying. Measured on the development machine:
+状态文件又大、又反复重写，所以直接写盘既慢、写放大又严重。开发机实测：
 
-| medium | 2 GB write |
+| 介质 | 写入 2 GB |
 |---|---|
-| tmpfs (`/dev/shm`) | 0.25 s (8.7 GB/s) |
-| ext4 on a loop device | 2.07 s (1.0 GB/s) |
+| tmpfs（`/dev/shm`） | 0.25 s（8.7 GB/s） |
+| loop 设备上的 ext4 | 2.07 s（1.0 GB/s） |
 
-So the working directory lives on tmpfs and `-persist-dir` is a durable,
-write-behind copy: refreshed on graceful exit, and used to park snapshots that
-are evicted from the working set. Only files whose mtime advanced are copied,
-and every copy is written to `*.tmp` then renamed, so an interrupted flush can
-never corrupt a snapshot.
+所以工作目录放在 tmpfs，而 `-persist-dir` 是一份持久化的写回副本：
+优雅退出时刷新一次，同时被工作集淘汰的快照会存放在那里。
+只复制 mtime 更新过的文件，而且每次复制都先写 `*.tmp` 再 `rename`，
+所以中途被打断也绝不会破坏一份快照。
 
-`SIGTERM`/`SIGINT` triggers a drain (wait for in-flight requests, so the slot
-isn't captured mid-generation), then the flush. `SIGKILL` and power loss will
-lose whatever had not been flushed.
+收到 `SIGTERM`/`SIGINT` 时，先 drain（等在途请求结束，避免在生成中途捕获槽位），再落盘。
+`SIGKILL` 和断电则会丢失尚未刷新的部分。
 
-## Configuration example
+## 配置示例
 
 ```bash
 llama-slot-proxy \
@@ -210,7 +188,7 @@ llama-slot-proxy \
   -v
 ```
 
-A minimal systemd unit:
+一份最小的 systemd unit：
 
 ```ini
 [Unit]
@@ -227,64 +205,50 @@ TimeoutStopSec=60
 WantedBy=multi-user.target
 ```
 
-## Caveats
+## 注意事项
 
-Read these before deploying.
+部署前请读一遍。
 
-* **The client must resend history verbatim.** Everything here rests on the
-  saved sequence being a strict prefix of the next prompt. A client that
-  truncates, summarises or rewrites earlier turns will simply miss the cache.
-  That is safe (the server falls back to normal prefix matching) and the proxy
-  retires repeatedly-missing snapshots, but it does mean no benefit.
-* **A shorter prompt under a reused session id falls back to the seed.** If a
-  client reuses one session id for a new conversation, the old conversation's
-  snapshot is deeper than the new prompt and would lose the prefix test. The
-  proxy detects this from the recorded message count and uses the seed instead,
-  so the new conversation still starts warm.
-* **State files are parsed for their header.** The proxy reads the first 12
-  bytes (magic, version, token count) to compare candidates without restoring
-  them. A change to that on-disk format in llama.cpp would make the proxy treat
-  files as absent — a graceful degradation, not a crash, but the cache would
-  stop working until the header parsing is updated.
-* **A snapshot's size is sanity-checked** against `149.63 MiB + 34.0 KiB ×
-  n_tokens`, because a save that ran out of space leaves a truncated file whose
-  header still claims a full token count. Files far short of the estimate are
-  ignored. The constants come from one hybrid model and are only used as a
-  floor, not an exact check.
-* **`-min-system-bytes` matters.** Many clients reuse a session id for small
-  side requests (title generation and the like). Their tiny system prompt would
-  build a useless seed and leave a shallow snapshot that poisons the real
-  conversation on the next turn. The default filters them out.
-* **One slot.** With `-np 1` a restore overwrites the resident state; the proxy
-  serializes accordingly. Multiple slots are not modeled.
-* **The proxy is not a cache for correctness — only for speed.** If every cache
-  operation fails it forwards the request unchanged. There is no path where a
-  cache failure changes a response.
+* **客户端必须逐字重发历史。** 这里的一切都建立在「已保存的序列是下一个提示词的严格前缀」
+  之上。裁剪、摘要、或改写早期轮次的客户端，只会错过缓存。这是安全的（服务端会退回到
+  正常的前缀匹配，代理也会退役反复未命中的快照），但确实意味着没有收益。
+* **同一 session id 下发了更短的提示词时，会退回到种子。** 如果客户端复用同一个 session id
+  开一个新对话，旧对话的快照比新提示词更深，会通不过前缀检验。代理会根据记录的消息条数
+  识别出这一点，改用种子，所以新对话依然是热的。
+* **状态文件会被解析文件头。** 代理读取前 12 字节（magic、version、token 数），
+  以便在不恢复的前提下比较候选。如果 llama.cpp 改了那个磁盘格式，代理会把文件视作不存在 ——
+  这是优雅降级而非崩溃，但缓存在更新解析逻辑之前会失效。
+* **快照大小会被合理性检查**，依据是 `149.63 MiB + 34.0 KiB × n_tokens`：
+  一次「空间不足」的保存会留下截断文件，而它的文件头仍然声称完整的 token 数。
+  远低于估算值的文件会被忽略。这组常数来自某一个混合模型，只用作下限，不是精确校验。
+* **`-min-system-bytes` 很重要。** 很多客户端会把同一个 session id 复用于一些小的旁路请求
+  （生成标题之类）。它们很短的 system 提示词会构建一个没用的种子，并留下一个浅快照，
+  下一轮污染真正的对话。默认值会把它们过滤掉。
+* **单槽位。** 在 `-np 1` 下恢复会覆盖常驻状态，代理据此串行化。多槽位未被建模。
+* **代理只关乎速度，不关乎正确性。** 即使所有缓存操作都失败，它也会原样转发请求。
+  不存在任何一条「缓存失败会改变响应内容」的路径。
 
-## Interaction with llama.cpp context checkpoints
+## 与 llama.cpp 上下文检查点的关系
 
-The proxy and llama.cpp's own context checkpoints (`-ctxcp`, `-cms`) solve
-overlapping but different problems, and they compose:
+代理与 llama.cpp 自己的上下文检查点（`-ctxcp`、`-cms`）解决的是**重叠但不同**的问题，
+它们可以叠加使用：
 
-* The proxy handles **whole-state reuse** — a new session, or a session whose
-  slot was taken over, restarting from a saved prefix.
-* Checkpoints handle **rolling back within a conversation** — for example when
-  the tail of a prompt is replaced (a retry, an edit, a branch), where only a
-  suffix can be reused instead of the whole thing.
+* 代理负责**整块状态复用** —— 新会话，或槽位被抢占、服务重启后的会话，从一份已保存的前缀重新起步。
+* 检查点负责**对话内部的回滚** —— 例如提示词尾部被替换时（重试、编辑、分支），
+  只复用一段后缀，而不是整块。
 
-Both are worth having. Note that a slot restore replaces the prompt state, so
-the proxy deliberately avoids restoring when the session is already resident, in
-order not to throw away the server's in-process checkpoints.
+两者都值得保留。注意：一次槽位恢复会替换掉提示词状态，所以当会话已经常驻时，
+代理会刻意不做恢复，以免白白丢掉服务端进程内的检查点。
 
-## Files
+## 文件说明
 
 ```
-main.go      request handling, decision order, forwarding, config
-cache.go     seeds, session snapshots, save policy, pruning, slot API client
-persist.go   tmpfs work dir + durable copy, eviction, lazy pull-back
-docs/DESIGN.md   the mechanisms behind the rules, with measurements
+main.go          请求处理、判定顺序、转发、配置
+cache.go         种子、会话快照、保存策略、淘汰、槽位 API 客户端
+persist.go       tmpfs 工作目录 + 持久副本、淘汰、按需取回
+docs/DESIGN.md   规则背后的机制，附实测数据
 ```
 
-## License
+## 许可
 
-MIT — see [LICENSE](LICENSE).
+MIT —— 见 [LICENSE](LICENSE)。

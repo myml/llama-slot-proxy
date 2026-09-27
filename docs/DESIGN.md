@@ -1,84 +1,75 @@
-# Design notes
+# 设计说明
 
-Why the proxy behaves the way it does. Almost every rule here exists because a
-simpler version was tried first and measured to be wrong. Numbers are from the
-development machine (Ryzen AI MAX+ 395 / Radeon 8060S, unified memory, 27B
-hybrid model, `q8_0` KV, 256K context, `-np 1`) unless stated otherwise.
+[English](DESIGN.en.md) | **中文**
+
+这里解释代理为什么这样设计。几乎每一条规则都源于：先写了一个更简单的版本，
+实测发现它是错的，然后才改成现在这样。除非特别说明，数据都来自开发机
+（Ryzen AI MAX+ 395 / Radeon 8060S，统一内存，27B 混合模型，`q8_0` KV，
+256K 上下文，`-np 1`）。
 
 ---
 
-## 1. The prefix law
+## 1. 前缀律
 
-llama-server reuses a saved state only when the saved token sequence is a
-**strict prefix** of the incoming prompt. It reports the reused length as
-`cache_n`, so the condition is:
+只有当已保存的 token 序列是来请求提示词的**严格前缀**时，llama-server 才会复用它。
+被复用的长度通过 `cache_n` 报出来，所以条件是：
 
 ```
-reuse  ⟺  cache_n == n_saved  and  saved_tokens is a prefix of prompt_tokens
+可复用  ⟺  cache_n == n_saved  且  已保存的 token 是新提示词的前缀
 ```
 
-Everything follows from this.
+后面的一切都由它推出。
 
-**Consequence for the seed.** A new session diverges from every other session
-exactly where the system message ends — because the next thing in the prompt is
-a user turn, and that differs per session. So a seed must stop *at* the system
-message. A seed extended by even one user turn would have `n_saved` past the
-divergence point of every other session, and would never be reused.
+**对种子的推论。** 新会话与其它所有会话的分歧点，恰好落在 system 消息结束之处 ——
+因为提示词里的下一段是用户轮次，而它因会话而异。所以种子必须**停在** system 消息处。
+哪怕多种子再往后接一个用户轮次，它的 `n_saved` 也会越过了其它所有会话的分歧点，
+于是永远不会被复用。
 
-This is not "the seed must not contain user messages". A session snapshot
-contains plenty of user messages and is reused fine, because for the *same*
-conversation the next prompt is a superset of the saved one. The rule is about
-where the divergence is, not about message roles.
+这并不是「种子里不能有用户消息」。会话快照里有很多用户消息，却照样能被复用，
+因为对**同一段**对话来说，下一轮的提示词是已保存内容的超集。
+规则说的是**分歧点在哪**，而不是消息的角色。
 
-**Consequence for staleness.** A snapshot containing generated tokens (a save
-after a completed turn does) is only valid if the client resends that
-generation in its next request. Clients that echo the assistant message —
-including its reasoning/thinking field — satisfy this. Clients that drop or
-rewrite it do not, and get no reuse.
+**对时效性的推论。** 一份包含生成 token 的快照（一轮结束后保存的都包含）
+只有在客户端把那次生成也重发回来时才有效。会回显助手消息 —— 包括它的
+reasoning/thinking 字段 —— 的客户端满足这个条件；丢弃或改写它的客户端不满足，也就拿不到复用。
 
-## 2. Restore is overwrite semantics
+## 2. 恢复是覆盖语义
 
-A restore replaces the slot's prompt state. It is **not** additive. Two
-restores in one request leave only the second one's state, so restoring the seed
-after a deeper session snapshot silently discards the better state.
+一次恢复会替换掉槽位的提示词状态。它**不是**叠加的。一个请求里做两次恢复，
+最后只会留下第二次的状态，所以在一个更深的会话快照之后再恢复种子，会静默地丢掉更好的那份状态。
 
-An early version of this proxy did exactly that, in the wrong order, and cost a
-real session a 67-second full recompute while every log line said "restored ok".
-The current code probes both candidates **without touching the slot** (it reads
-the token count out of each state file's header) and restores only the deeper
-one.
+这个代理的早期版本就犯了这样的错，而且顺序还是反的，代价是让一段真实会话多花了
+67 秒做全量重算，而每一行日志都写着「恢复成功」。
+现在的代码会**在不碰槽位的前提下**探查两个候选（从各自状态文件的头部读出 token 数），
+只恢复更深的那一个。
 
-## 3. Don't restore when the state is already resident
+## 3. 状态已在槽位里时不做恢复
 
-llama-server keeps the slot's state between requests. Restoring for a session
-that is *already* the resident one is therefore pure overhead:
+llama-server 会在请求之间保留槽位状态。所以当某个会话**本来就是**常驻槽位的那一个时，
+为它做恢复纯属浪费：
 
-* it costs a full state-file read and deserialize (~0.13 s for a 640 MB file);
-* it **destroys the server's in-process context checkpoints**, which are what
-  let the server roll back cheaply when a prompt's tail is replaced.
+* 要付一次完整的状态文件读取与反序列化（640 MB 的文件约 0.13 s）；
+* 它会**毁掉服务端进程内的上下文检查点** —— 而那正是提示词尾部被替换时，
+  服务端能廉价回滚的依仗。
 
-Measured on continuous turns: the same number of tokens are processed either
-way, but a redundant restore adds roughly 0.4 s per turn. So the fast path is
-"forward, don't touch anything", and the proxy tracks which session owns the
-slot (verifying against the server's `/slots` each time, since the server is the
-only source of truth).
+连续轮次实测：两种做法处理的 token 数完全相同，但一次多余的恢复每轮要多花约 0.4 s。
+所以快路径是「直接转发，什么都别碰」；代理会记录哪个会话占着槽位，
+并且每次都向服务端的 `/slots` 核对（服务端才是唯一真相源）。
 
-## 4. Why a bad snapshot is worse than no snapshot
+## 4. 为什么坏快照比没有快照更糟
 
-If a snapshot is restored but not actually reused, the request pays *both* the
-restore and a full recompute — and it has thrown away the checkpoints the server
-would otherwise have used.
+如果一份快照被恢复、却没有真正被复用，那么这个请求既要付恢复的代价，
+又要付全量重算的代价 —— 而且它还把服务端本来能用的检查点丢掉了。
 
-So the proxy counts consecutive non-reuses per session and retires a snapshot
-after two of them. It would rather fall back to the server's own prefix matching
-than keep forcing a losing restore.
+所以代理会按会话统计连续未命中的次数，达到两次就退役该快照。
+它宁可退回到服务端自己的前缀匹配，也不愿继续强行做一次注定失败的恢复。
 
-## 5. When a restore is silently discarded
+## 5. 恢复被静默丢弃的情形
 
-This one is subtle and cost a lot of debugging time.
+这一条很隐蔽，当初耗掉了很多排查时间。
 
-After a restore, llama-server decides whether to even *look* for a checkpoint
-using (in `server-context.cpp`):
+一次恢复之后，llama-server 会用下面的逻辑决定要不要**去找**检查点
+（源码在 `server-context.cpp`）：
 
 ```cpp
 const bool has_new_tokens = (n_past < n_prompt_in);
@@ -87,127 +78,108 @@ const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 
 if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
     const auto pos_min = llama_memory_seq_pos_min(memory, slot.id);
     if (pos_min >= pos_min_thold) {
-        // search the checkpoint list for a usable entry; if none -> full recompute
+        // 在检查点列表里找可用的；找不到 -> 全量重算
     }
 }
 ```
 
-A restore installs the saved state with `pos_min = n_saved - 1`. So:
+一次恢复装入的状态满足 `pos_min = n_saved - 1`。于是：
 
-| incoming prompt | `has_new_tokens` | `pos_min_thold` | `pos_min` | outcome |
+| 来请求的提示词 | `has_new_tokens` | `pos_min_thold` | `pos_min` | 结果 |
 |---|---|---|---|---|
-| **longer** than the snapshot | true | `n_past` | `n_past - 1` | `pos_min < thold` → no search → **reuse** |
-| **not longer** than the snapshot | false | `n_past - 1` | `n_past - 1` | search runs, and a restored slot's checkpoint list is empty → **full recompute** |
+| **比快照长** | true | `n_past` | `n_past - 1` | `pos_min < thold` → 不搜索 → **复用** |
+| **不比快照长** | false | `n_past - 1` | `n_past - 1` | 进入搜索，而恢复后的槽位检查点列表是空的 → **全量重算** |
 
-Two practical notes:
+两点实践提醒：
 
-* A request that re-sends a prompt no longer than what was saved does *not*
-  benefit, and pays full price. Echoing a generation back is normally enough to
-  stay ahead, but if a client appends very little after a long generation the
-  saved state can end up ahead of the new prompt.
-* The checkpoint list is empty after a restore because
-  `server_prompt::clear()` clears `checkpoints` along with `tokens`, and
-  `SLOT_RESTORE` calls it. The proxy's snapshots therefore carry no
-  rollback capability of their own — that is what the server's in-process
-  checkpoints are for, which is another reason not to disturb them (§3).
+* 重发的提示词如果不比已保存的长，就**不会**受益，而且要付全额代价。
+  把生成内容回显回去通常就足以保持领先；但如果客户端在一次很长的生成之后只追加了很少的内容，
+  已保存的状态就可能跑到新提示词前面去。
+* 恢复之后检查点列表为空，是因为 `server_prompt::clear()` 把 `checkpoints`
+  连同 `tokens` 一起清掉了，而 `SLOT_RESTORE` 会调用它。所以代理自己的快照
+  不携带任何回滚能力 —— 回滚靠的是服务端进程内的检查点，这也是不要打扰它们的另一个理由（第 3 节）。
 
-### 5.1 Guarding against a stale snapshot shadowing a valid seed
+### 5.1 防止陈旧快照遮蔽有效种子
 
-The candidate comparison in §2 picks the deeper of the two, but "deeper" is not
-the same as "usable". If a client reuses one session id for a new conversation —
-or simply restarts one — the previous conversation's snapshot is much deeper
-than the new prompt, wins the comparison, and then fails the prefix test. The
-result is a full recompute, and the seed that would have worked is never tried.
+第 2 节的候选比较会挑更深的那一个，但「更深」并不等于「可用」。
+如果客户端复用同一个 session id 开了一段新对话 —— 或者只是重新开始一段 ——
+上一段对话的快照会比新提示词深得多，赢下比较，然后通不过前缀检验。
+结果就是一次全量重算，而那个本来会生效的种子，从未被尝试过。
 
-An earlier version of this proxy did exactly that: re-sending a 15-message
-prompt under a session whose snapshot held 19 messages cost a 52-second full
-recompute, while every log line said the restore had succeeded.
+这个代理的早期版本正是如此：用同一个 session 重发一个 15 条消息的提示词，
+而该 session 的快照有 19 条消息，代价是一次 52 秒的全量重算，
+而每一行日志都写着恢复成功。
 
-This is decidable without tokenizing anything, because the sidecar already
-records how many messages the conversation had when the snapshot was written. A
-snapshot taken from a longer conversation cannot be a prefix of a shorter
-request, so it is skipped — and the file is *kept*, because the client may
-return with the longer prompt.
+这件事无需分词就能判定，因为侧车文件已经记录下写快照时对话有多少条消息。
+从更长对话里取下的快照，不可能是一个更短请求的前缀，所以直接跳过它 ——
+并且**保留该文件**，因为客户端可能带着那个更长的提示词回来。
 
-| same session, 19-message snapshot, 15-message request | tokens prefilled | wall |
+| 同一 session，19 条消息的快照，15 条消息的请求 | 预填充 token | 墙钟 |
 |---|---|---|
-| without the guard | 13,789 (full recompute) | 52 s |
-| with the guard | 5,604 (seed used) | 23 s |
+| 没有这道防线 | 13,789（全量重算） | 52 s |
+| 有这道防线 | 5,604（用上种子） | 23 s |
 
-## 6. Save policy: content growth, not time
+## 6. 保存策略：按内容增长，而非按时间
 
-State files are large. Restoring a 640 MB file takes ~0.13 s, and saving one
-takes ~0.14 s on tmpfs; doing that on every request at a moderate request rate
-works out to hundreds of GB per day of writes.
+状态文件很大。恢复一份 640 MB 的文件约 0.13 s，在 tmpfs 上保存一份约 0.14 s；
+在中等的请求速率下每个请求都做一次，折算下来是每天数百 GB 的写入量。
 
-Saving on a timer is the obvious alternative and is wrong in both directions: it
-wastes writes while the user is idle, and misses saves during a burst.
+显而易见的替代方案是按定时器保存，但它在两个方向上都是错的：
+用户空闲时白白写入，突发流量时又漏掉保存。
 
-Instead the proxy saves on **content growth** — every `N` new tokens or `M` new
-messages, both measured from the server's own `/slots` token count — plus on
-**slot handover**, which is the only moment the outgoing session's state can
-still be captured. A continuous conversation therefore writes roughly once per
-`N` tokens rather than once per request, and a conversation that never loses the
-slot writes nothing at all in steady state.
+所以代理改为按**内容增长**保存 —— 每新增 `N` 个 token 或 `M` 条消息保存一次，
+两者都以服务端自己的 `/slots` token 计数为准 —— 外加**槽位换手**时保存，
+因为那是当前会话状态还能被捕获的唯一时刻。
+因此一段连续的对话大约每 `N` 个 token 写一次，而不是每个请求都写；
+而一段从未失去槽位的对话，在稳态下完全不写盘。
 
-## 7. Retiring snapshots a seed already covers
+## 7. 退役「种子已覆盖」的快照
 
-A session snapshot that is barely deeper than the seed it shares a system prompt
-with buys a few hundred tokens while costing a full-size file on disk and an
-extra copy on every flush. The proxy compares the two and drops the snapshot
-when it is not meaningfully deeper (same thresholds as §6) *and* the session is
-young. When it cannot answer the question — no seed, no snapshot, no sidecar —
-it keeps the file. Retaining too much is recoverable; deleting the wrong thing
-is not.
+一份与其共享 system 提示词的种子相比只深一点点的会话快照，
+只能多换几百个 token，代价却是磁盘上一份完整大小的文件、以及每次刷新时多拷一份。
+代理会比较两者，当它没有实质性地更深（阈值与第 6 节相同）**且**该会话还很年轻时，就丢掉这份快照。
+当它无法回答这个问题时 —— 没有种子、没有快照、没有侧车 —— 它会保留文件。
+多留是可以补救的；删错东西则不是。
 
-## 8. tmpfs, and a durable behind it
+## 8. tmpfs，以及它后面的持久层
 
-The working directory must be the server's `--slot-save-path`, because the proxy
-only ever passes a *filename*: the server resolves it relative to its own
-configured path and does the I/O itself. Three consequences:
+工作目录必须是服务端的 `--slot-save-path`，因为代理从头到尾只传一个**文件名**：
+服务端相对它自己配置的路径解析，并且由它自己完成 I/O。这带来三个推论：
 
-* the two processes must share a filesystem, at the same path;
-* the proxy can read a state file's header locally, cheaply, to compare
-  candidates without restoring them;
-* there is no upload path — a proxy in a different container needs a shared
-  mount, not a protocol.
+* 两个进程必须共用同一个文件系统、同一个路径；
+* 代理可以在本地廉价地读取状态文件的头部，从而在不恢复的前提下比较候选；
+* 不存在上传通道 —— 放在另一个容器里的代理需要共享挂载，而不是一个协议。
 
-Given that, the working set belongs on tmpfs and durability is a separate
-concern:
+基于这一点，工作集该放在 tmpfs 上，而持久性是另一件事：
 
-| medium | 2 GB write |
+| 介质 | 写入 2 GB |
 |---|---|
-| tmpfs (`/dev/shm`) | 0.25 s (8.7 GB/s) |
-| ext4 on a loop device | 2.07 s (1.0 GB/s) |
+| tmpfs（`/dev/shm`） | 0.25 s（8.7 GB/s） |
+| loop 设备上的 ext4 | 2.07 s（1.0 GB/s） |
 
-`-persist-dir` gets a write-behind copy, refreshed on graceful exit and used to
-park evicted snapshots. Restores from it are lazy — nothing is preloaded — and
-every copy goes through `*.tmp` + `rename` so an interrupted flush leaves the
-old file intact rather than a truncated new one.
+`-persist-dir` 收到一份写回副本：优雅退出时刷新，同时用来存放被淘汰的快照。
+从它取回是惰性的 —— 不做任何预热 —— 而且每次复制都经过 `*.tmp` + `rename`，
+所以中途被打断只会留下旧文件完好，而不是一个截断的新文件。
 
-**Symbolic links instead of copies do not work here.** A symlink to the durable
-copy restores fine (zero-copy, ~5x faster), but the *save* path writes through
-it straight to disk, which reintroduces exactly the slow, write-amplifying
-behaviour the tiering exists to avoid.
+**用符号链接代替复制在这里行不通。** 指向持久副本的符号链接恢复起来没问题
+（零拷贝，大约快 5 倍），但**保存**路径会穿透它直接写到磁盘上，
+这恰恰把分级要避免的「慢 + 写放大」行为又请了回来。
 
-## 9. Two failure modes that cost real debugging time
+## 9. 两个耗掉大量排查时间的失败模式
 
-**Pruning hung off the save's success.** The code pruned evicted snapshots only
-after a successful save. Once tmpfs filled up, the save failed, so pruning never
-ran, so nothing was ever freed — a permanent stall. Pruning now happens *before*
-the write, reserving space for the snapshot about to be created, and again on
-failure.
+**淘汰逻辑挂在了保存成功之后。** 代码只在保存成功之后才淘汰被挤掉的快照。
+一旦 tmpfs 写满，保存就失败，于是淘汰永不执行，于是永远不释放空间 —— 永久卡死。
+现在淘汰发生在写入**之前**，为即将创建的这份快照预留空间，失败时再淘汰一次。
 
-**Truncated files lie.** A save that runs out of space leaves a partial file
-whose header still reports the full token count. It looks like the *deepest*
-candidate and is only discovered to be broken at restore time. The proxy now
-compares each file's size against the size law (`149.63 MiB + 34.0 KiB ×
-n_tokens`) and treats anything far short as absent, and it removes the partial
-file when a save fails.
+**截断的文件会撒谎。** 一次空间不足的保存会留下一个部分文件，
+而它的头部仍然报出完整的 token 数。它看起来是**最深**的候选，
+只有到恢复的时候才被发现是坏的。现在代理会把每个文件的大小与尺寸定律
+（`149.63 MiB + 34.0 KiB × n_tokens`）对比，远低于估算值的就当作不存在；
+并且保存失败时会删掉那个部分文件。
 
-## 10. State file format
+## 10. 状态文件格式
 
-The proxy reads, but never writes, llama state files. The header is:
+代理只读取、从不写入 llama 状态文件。头部是：
 
 ```
 u32 magic
@@ -215,16 +187,12 @@ u32 version
 u32 n_token_count
 ```
 
-followed by the token array and the serialized state. Only the third field is
-used (and the file size, §9). A truncated or unreadable header is treated as
-"no snapshot", never as an error — the request still goes through.
+后面跟着 token 数组和序列化状态。只用到第三个字段（以及文件大小，见第 9 节）。
+头部截断或读不出来时，一律当作「没有快照」，而绝不当作错误 —— 请求照样通过。
 
-## 11. Deliberate non-goals
+## 11. 刻意不做的事
 
-* **No request rewriting.** The proxy restores and then forwards the body
-  untouched. This is what makes a cache failure a performance event rather than
-  a correctness event.
-* **No multi-slot modeling.** `-np 1` is assumed; the cache work is serialized
-  behind one lock.
-* **No warm-up.** Serving the first request promptly matters more than having
-  every snapshot resident.
+* **不改写请求。** 代理先恢复，然后把请求体原样转发。
+  正因如此，缓存失败只是一次性能事件，而不是一次正确性事件。
+* **不为多槽位建模。** 假定 `-np 1`；缓存操作串行化在一把锁后面。
+* **不做预热。** 让第一个请求得到及时响应，比让每份快照都常驻更重要。
