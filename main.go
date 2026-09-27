@@ -164,7 +164,7 @@ func main() {
 		close(shutdown)
 	}()
 
-	log.Printf("llama-proxy listening on %s -> %s (cache=%s dry_run=%v)",
+	log.Printf("llama-slot-proxy listening on %s -> %s (cache=%s dry_run=%v)",
 		cfg.Listen, cfg.Upstream, cfg.CacheDir, cfg.DryRun)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("serve: %v", err)
