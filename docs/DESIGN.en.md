@@ -377,7 +377,81 @@ The first row is a short answer with no streaming at all: under 2 KB, so the buf
 The second is roughly 90 ms of added first-token latency at a realistic size, plus a visible stall
 every ~2 KB.
 
-## 14. Slot ownership fails on two paths
+## 14. `-np 1` means "just passing through" still corrupts the cache
+
+The slot is **global**, not one per endpoint. So "this request is not cached" and "this request does
+not affect the cache" are different statements — I treated them as the same one, and the price was a
+**silent data corruption**.
+
+### 14.1 The scene
+
+Production log, two real conversations:
+
+```
+15:34:42  built seed name=seed-6d29… bytes=99497 prefill_tokens=24912
+15:35:00  session-49bfe0fa  cache_n=24912 prompt_n=2096  118.3s     <- reused fine
+15:35:04  restore name=seed-6d29… n_restored=58  ms=63.9            <- only 58 came back
+15:37:07  session-b670970d  cache_n=0  prompt_n=27009  122.8s       <- full recompute
+```
+
+The same seed file: 24,912 in the slot one moment, 58 read back from disk minutes later.
+
+On disk: the header said `token=62` for a file that was supposed to be a 24,912-token seed. **The
+format was valid, the size was 151.6 MiB, and it passed the size sanity check** — so `slotProbe`
+allowed it, and the problem only surfaced at restore time.
+
+### 14.2 Root cause
+
+`isAuxiliary()` returned **before** the lock was taken:
+
+```
+15:34:42.730950  built seed …            <- seed prefill finished
+15:34:42.760     an aux request arrives  <- no lock, forwarded straight through
+15:34:42.760+    slotSave(name)          <- saves the AUX request's state
+```
+
+The window between `/completion` returning and `slotSave` is milliseconds, and a request that took no
+lock walked into it.
+
+**Why it stayed hidden**: building a seed leaves the seed resident, so **the request that built it
+never touches disk** and looks perfectly healthy. The damage only appears on the next session sharing
+that system prompt — which is the entire point of the seed mechanism.
+
+### 14.3 The fix
+
+**(a) Every slot user takes the lock.** Auxiliary requests still skip the cache entirely, but they now
+serialize with it and `forgetSlot()` afterwards, because the resident state has been replaced by
+something we never want to save. Non-cached but slot-using endpoints (`/v1/completions`,
+`/v1/messages`, `/infill`, embeddings, rerank, transcriptions) take it too.
+
+**Pure metadata endpoints deliberately do not** (`/props`, `/models`, `/health`, `/tokenize`,
+`/detokenize`, `/apply-template`, `/slots`) — they do not use the slot, and making them wait would let
+a long generation block `/health`. Measured `/health` latency: **3 ms**.
+
+**(b) A save checks itself.** `buildSeed` reads the header back and confirms the token count is
+commensurate with what was just prefilled (a little slack, because the saved sequence runs a few
+tokens past `prompt_n`: 8185 prefilled, 8189 in the file), and deletes the file otherwise. Any
+remaining race then degrades into a cache miss instead of a silent bad seed.
+
+### 14.4 A/B reproduction (fresh key each round)
+
+An auxiliary request fired deliberately during a seed build:
+
+| | tokens in the file | tokens just prefilled | |
+|---|---|---|---|
+| **before** | **63** | 3,168 | corrupt (same shape as production's 62 vs 24,912) |
+| **after** | **3,172** | 3,168 | correct |
+
+### 14.5 Lessons
+
+1. **"Not cached" does not mean "does not share state".** A single slot is a global resource, and
+   every user of it belongs behind the same lock.
+2. **A save must verify what it stored.** A file that is well formed, plausibly sized and *wrong* is
+   the hardest kind to find, because it passes every cheap check.
+3. **`-max-seeds 4` evicts older seeds when several systems are in play.** My test seeds pushed the
+   production one out; expected behaviour, but worth knowing.
+
+## 15. Slot ownership fails on two paths
 
 "Already resident ⇒ forward directly" is the highest-value decision, so it is also the most costly
 to get wrong: it **skips a restore that would have worked**. Both paths are fixed.
@@ -400,7 +474,7 @@ request looked "resident" ⇒ its snapshot restore was skipped and everything wa
 recording code read `up.cacheN` directly ⇒ panic. The client got a reset connection rather than a
 502 (measured `HTTP=000`). Fix: return early on nil and count it in `upstream_errors`.
 
-## 15. Deliberate non-goals
+## 16. Deliberate non-goals
 
 * **No request rewriting.** The proxy restores and then forwards the body
   untouched. This is what makes a cache failure a performance event rather than

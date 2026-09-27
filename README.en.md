@@ -355,6 +355,17 @@ Read these before deploying.
   cache entry and the old ones become unreferenced garbage collected by the existing eviction —
   **no manual cleanup**. (The state *format* version is checked by llama.cpp itself, see
   `LLAMA_STATE_SEQ_VERSION`, so upgrading llama.cpp is safe.)
+* **Every slot user serializes, not just the two cached endpoints.** With `-np 1` there is one
+  slot, so a request that "merely passes through" does not leave the cache alone — it overwrites
+  the state a cache operation is in the middle of producing. Auxiliary requests (tiny system
+  prompt, filtered by `-min-system-bytes`) and the non-cached but slot-using endpoints
+  (`/v1/completions`, `/v1/messages`, `/infill`, ...) take the same lock. Pure metadata endpoints
+  (`/props`, `/health`, `/tokenize`) deliberately do not, or a long generation would block
+  `/health`.
+* **A seed save checks itself.** After saving, the proxy reads the file header back and confirms it
+  holds roughly as many tokens as were just prefilled; if not, it deletes the file. Without that
+  check a race can persist *another request's* state as the seed — well formed, passing the size
+  sanity check, and only caught by this comparison.
 * **Streaming responses are flushed per chunk.** Each SSE event is forwarded as soon as it arrives.
   This matters most for short answers: buffered, a stream under 2 KB reaches the client in one piece
   only after the whole response has finished.
