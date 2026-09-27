@@ -266,11 +266,15 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// /v1/chat/completions and /v1/responses are eligible. llama.cpp converts
+	// /v1/chat/completions and /v1/responses are cached. llama.cpp converts
 	// Responses to the same internal chat form, so the slot, the checkpoints and
-	// the save/restore path are identical. Everything else is a plain passthrough.
-	if (r.URL.Path != "/v1/chat/completions" && r.URL.Path != "/v1/responses") ||
-		r.Method != http.MethodPost {
+	// the save/restore path are identical.
+	cached := r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/responses"
+
+	// Everything else is a passthrough — but a passthrough that also uses the
+	// slot still has to serialize with the cache operations (see below), while a
+	// metadata read must NOT, or a long generation would block /health.
+	if r.Method != http.MethodPost || (!cached && !usesSlot(r.URL.Path)) {
 		p.passthrough(w, r, start, nil)
 		return
 	}
@@ -281,6 +285,21 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body.Close()
+
+	if !cached {
+		// Not cacheable, but it replaces the slot state just the same.
+		if p.lock(p.cfg.LockWait) {
+			p.passthrough(w, r, start, body)
+			p.forgetSlot()
+			p.unlock()
+		} else {
+			log.Printf("WARN lock timeout path=%s action=passthrough", r.URL.Path)
+			p.rec.count("lock_timeout")
+			p.forgetSlot()
+			p.passthrough(w, r, start, body)
+		}
+		return
+	}
 
 	info, err := p.parseRequest(r, body)
 	if err != nil || !info.IsChat {
@@ -294,29 +313,44 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Auxiliary request? Forward without ever touching the slot.
-	if p.isAuxiliary(info) {
-		log.Printf("INFO aux request skipped session=%s msgs=%d sys_bytes=%d stream=%v",
-			info.Session, info.NMsgs, len(info.System), info.Stream)
-		p.forgetSlot() // an untracked request may have overwritten the slot
-		p.rec.count("aux")
-		p.passthrough(w, r, start, body)
-		return
-	}
-
-	// Degrade D: lock timeout -> forward without touching the cache.
+	// Everything that uses the slot has to serialize, including the requests
+	// that merely pass through. With `-np 1` there is ONE slot, so a passthrough
+	// does not just "not touch the cache" — it overwrites whatever state a cache
+	// operation is in the middle of producing.
+	//
+	// Measured: an aux request that arrived 29 ms before a seed's save made that
+	// save capture the AUX request's state. The file was well formed and passed
+	// the size sanity check — it just held 62 tokens instead of 24,912 — and
+	// because the seed had been left resident in the slot, the request that
+	// built it never noticed. The next session sharing that system prompt
+	// restored the broken seed and paid a full 27,009-token prefill.
 	if !p.lock(p.cfg.LockWait) {
+		// Degrade D: lock timeout -> forward without touching the cache. This is
+		// the one path that still races, and it is deliberately the last resort:
+		// the alternative is refusing the request.
 		log.Printf("WARN lock timeout session=%s action=passthrough", info.Session)
 		p.rec.count("lock_timeout")
-		// This request is about to overwrite the slot without us capturing it,
-		// so the recorded owner no longer describes what is resident. Keeping
-		// the stale claim would make the owner's next request look "resident",
+		// The request is about to overwrite the slot without us capturing it, so
+		// the recorded owner no longer describes what is resident. Keeping the
+		// stale claim would make the owner's next request look "resident",
 		// skipping the snapshot restore that would actually have worked.
 		p.forgetSlot()
 		p.passthrough(w, r, start, body)
 		return
 	}
 	defer p.unlock()
+
+	// Auxiliary request? Skip the CACHE, not the slot: take the lock, consume the
+	// slot, and forget the ownership afterwards, because whatever was resident
+	// has just been replaced by a state we never want to save.
+	if p.isAuxiliary(info) {
+		log.Printf("INFO aux request skipped session=%s msgs=%d sys_bytes=%d stream=%v",
+			info.Session, info.NMsgs, len(info.System), info.Stream)
+		p.rec.count("aux")
+		p.passthrough(w, r, start, body)
+		p.forgetSlot()
+		return
+	}
 
 	// --- strategy A: if the slot currently holds a DIFFERENT session, persist
 	// that session before we overwrite it. This is the only moment its state
@@ -459,6 +493,25 @@ func (p *Proxy) parseRequest(r *http.Request, body []byte) (*reqInfo, error) {
 		Stream:  doc.Stream,
 		NMsgs:   len(doc.Messages),
 	}, nil
+}
+
+// usesSlot reports whether a non-cached endpoint still consumes the single
+// slot. With `-np 1` there is one slot, so a request that merely passes through
+// does not just "not touch the cache" — it overwrites whatever state a cache
+// operation is in the middle of producing. Anything that generates does.
+//
+// Metadata endpoints (props, models, tokenize, detokenize, apply-template,
+// health, metrics, slots) are deliberately absent: they do not use the slot, and
+// making them wait on the lock would let a long generation block /health.
+func usesSlot(path string) bool {
+	switch path {
+	case "/v1/completions", "/completions", "/completion",
+		"/v1/messages", "/infill", "/v1/embeddings", "/embeddings", "/embedding",
+		"/v1/rerank", "/reranking", "/rerank",
+		"/v1/audio/transcriptions", "/audio/transcriptions":
+		return true
+	}
+	return false
 }
 
 // sessionOf returns the session identity. Without one the proxy still works —

@@ -111,6 +111,25 @@ func (p *Proxy) buildSeed(info *reqInfo, name string) error {
 	if !p.slotSave(name) {
 		return fmt.Errorf("save seed")
 	}
+
+	// Verify what actually landed. A save that races with another request using
+	// the slot captures THAT request's state instead; the file is well formed
+	// and passes the size sanity check, so only this comparison catches it.
+	// Observed: 62 tokens written where 24,912 had just been prefilled.
+	//
+	// The saved sequence is a few tokens longer than prompt_n (the build reports
+	// 8185 where the file holds 8189), so allow a little slack rather than
+	// demanding equality.
+	slack := cmp.Timings.PromptN / 50
+	if slack < 8 {
+		slack = 8
+	}
+	if got := p.readStateTokens(name); got+slack < cmp.Timings.PromptN {
+		_ = os.Remove(p.cachePath(name))
+		return fmt.Errorf("seed holds %d tokens where %d were prefilled (the slot was overwritten while saving)",
+			got, cmp.Timings.PromptN)
+	}
+
 	log.Printf("INFO built seed name=%s bytes=%d prefill_tokens=%d", name, len(seed), cmp.Timings.PromptN)
 	return nil
 }
