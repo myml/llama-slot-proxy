@@ -92,6 +92,18 @@ A new conversation sharing that system prompt, at about 13.8K tokens of context:
 | No cache | 13,789 | 52.8 s |
 | Seed restored | 5,604 | **22.9 s** |
 
+The same statistic for **real traffic in production**: ten consecutive real new
+conversations pulled from the proxy log (an 8,185-token system prompt with only a few
+dozen tokens of actual user message).
+
+| | tokens to recompute | wall time |
+|---|---|---|
+| New conversation, no seed (the misses in the same log) | 8,267 (full prefill) | 38.5-67.8 s |
+| New conversation, seed hit (10 of 10 real conversations) | **82** | **6.2-12.0 s** |
+
+In other words: **all 8,185 system-prompt tokens were reused and only 82 were left to
+compute.**
+
 Restoring is cheap: a 640 MB state file reads back in about 130 ms. On this machine the state size
 follows
 
