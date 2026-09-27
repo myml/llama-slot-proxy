@@ -1,0 +1,5 @@
+# built binary
+/llama-slot-proxy
+
+# transient state files
+*.tmp
