@@ -84,7 +84,7 @@ type Config struct {
 	// Cap for the durable directory (CacheDir is capped by MaxBytes).
 	DurableBytes int64
 
-	// HTTP header carrying the session identity.
+	// Header carrying the session identity. DSH sends `Session_id`.
 	SessionHeader string
 }
 
@@ -212,6 +212,7 @@ type Proxy struct {
 	// otherwise roll back to. Measured: steady-state turns process the same
 	// number of tokens either way, while a redundant restore adds ~0.4 s.
 	slotOwner  string // session whose state currently sits in the slot
+	slotKey    string // system+tools the slot was claimed under
 	slotTokens int64  // tokens resident (0 = empty/unknown)
 
 	// Strategy B bookkeeping: how much of each session is already on disk.
@@ -316,7 +317,7 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 	// ---- slot continuity: the cheapest and best path ----
 	// If this session's state is already in the slot, llama-server's own
 	// prefix matching handles the continuation. Do NOT restore.
-	if p.slotHolds(info.Session) {
+	if p.slotHolds(info) {
 		sessState = "resident"
 	} else {
 		sessN := p.sessionSnapshotN(info) // does not touch the slot
@@ -355,7 +356,7 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 	// --- record who owns the slot now (for the continuity fast path) ---
 	if up != nil {
 		p.noteReuse(info.Session, up.cacheN)
-		p.claimSlot(info.Session)
+		p.claimSlot(info.Session, info.Key)
 		p.noteMsgs(info.Session, info.NMsgs)
 		// Stamp the fingerprint now, not only on save: a session that stays
 		// resident never triggers a save, and without a sidecar a later
@@ -408,8 +409,9 @@ func (p *Proxy) parseRequest(r *http.Request, body []byte) (*reqInfo, error) {
 		return nil, fmt.Errorf("no leading system message")
 	}
 
-	// Session identity: the configured header, then a common fallback. Without
-	// one the proxy still works, it just cannot recognize returning sessions.
+	// DSH sends `Session_id`. Without any session id the proxy still works —
+	// it just cannot recognize a returning conversation, so the session
+	// snapshot path stays unused and only the seed path applies.
 	session := strings.TrimSpace(r.Header.Get(p.cfg.SessionHeader))
 	if session == "" {
 		session = strings.TrimSpace(r.Header.Get("X-Client-Request-Id"))

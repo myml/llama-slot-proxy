@@ -576,14 +576,24 @@ func (r *recorder) add(e rec) {
 // conversation (which is the normal case, including tool-call round trips) the
 // slot is already warm, and a restore both wastes ~0.4 s and discards the
 // server's in-process checkpoints.
-func (p *Proxy) slotHolds(session string) bool {
-	if session == "" {
+func (p *Proxy) slotHolds(info *reqInfo) bool {
+	if info.Session == "" {
 		return false
 	}
 	p.smu.Lock()
-	owner, n := p.slotOwner, p.slotTokens
+	owner, key, n := p.slotOwner, p.slotKey, p.slotTokens
 	p.smu.Unlock()
-	if owner != session || n <= 0 {
+	if owner != info.Session || n <= 0 {
+		return false
+	}
+	// The session id alone is not enough to call the slot resident: if the
+	// resident state was claimed under a different system prompt or tool set,
+	// it does not hold THIS request's prefix. Forwarding it as "resident"
+	// would then cost a full prefill and skip the seed that avoids it.
+	// (Auxiliary requests are already filtered out by -min-system-bytes; this
+	// guards the same shape when it slips past that filter, e.g. after the
+	// system prompt or tools changed mid-session.)
+	if key != info.Key {
 		return false
 	}
 	// Verify against the live slot; the server is the source of truth.
@@ -623,14 +633,14 @@ func (p *Proxy) slotTokensLive() (int64, bool) {
 }
 
 // claimSlot records that this session now occupies the slot.
-func (p *Proxy) claimSlot(session string) {
+func (p *Proxy) claimSlot(session, key string) {
 	n, ok := p.slotTokensLive()
 	if !ok {
 		p.forgetSlot()
 		return
 	}
 	p.smu.Lock()
-	p.slotOwner, p.slotTokens = session, n
+	p.slotOwner, p.slotKey, p.slotTokens = session, key, n
 	p.smu.Unlock()
 }
 
@@ -638,7 +648,7 @@ func (p *Proxy) claimSlot(session string) {
 // account for, such as an auxiliary call).
 func (p *Proxy) forgetSlot() {
 	p.smu.Lock()
-	p.slotOwner, p.slotTokens = "", 0
+	p.slotOwner, p.slotKey, p.slotTokens = "", "", 0
 	p.smu.Unlock()
 }
 
