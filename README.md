@@ -114,6 +114,36 @@ llama.cpp 在两次请求之间**本来就保留着槽位里的状态**。所以
 所以代理的第一快路径是「直接转发，什么都别碰」。这一点也是它和 llama.cpp 自带的
 上下文检查点（`-ctxcp`、`-cms`）能配合而不是互斥的原因，详见最后一节。
 
+## 支持哪些接口
+
+代理缓存这两个端点，其余一律原样透传：
+
+| 端点 | 缓存 |
+|---|---|
+| `/v1/chat/completions`（OpenAI Chat） | ✅ |
+| `/v1/responses`（OpenAI Responses） | ✅ |
+| 其它（`/v1/messages`、`/v1/completions`、`/embeddings`、`/health`…） | 透传，不缓存 |
+
+**为什么两个接口是同一件事**：llama.cpp 自己就把 Responses 转成内部的 chat 形式
+（`server_chat_convert_responses_to_chatcmpl`），三条接口最终都走到同一个
+`handle_completions_impl`。所以**提示词渲染、槽位、上下文检查点、
+`--slot-save-path` 的 save/restore 全部共用**，代理只需要把「system 文本」和
+「消息条数」两件事从另一种 JSON 形状里读出来。
+
+⚠️ **Anthropic 的 `/v1/messages` 不缓存**（llama.cpp 同样原生支持它）。如果你的客户端用它，
+代理依然会正常服务、只是没有加速 —— 需要的话可以按同样方式加，是同一个套路。
+
+⚠️ **Responses 的输入必须是 Responses 自己的形状**（带类型的 item）：
+
+```json
+{"instructions": "你是助手…",
+ "input": [{"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "你好"}]}]}
+```
+
+另外 **`previous_response_id` 不被 llama.cpp 支持**，客户端必须每轮重发完整 `input`
+（DSH 正是如此）。
+
 ## 前置条件
 
 * 一个带 `--slot-save-path` 选项、以及 `/slots?action=save|restore` 接口的 llama.cpp 构建

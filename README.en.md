@@ -129,6 +129,37 @@ redundant restore adds about 0.4 s per turn. So the proxy's first fast path is "
 nothing". This is also why it composes with llama.cpp's own context checkpoints (`-ctxcp`, `-cms`)
 rather than competing with them — see the last section.
 
+## Which endpoints are cached
+
+Two endpoints are cached; everything else is forwarded untouched:
+
+| Endpoint | Cached |
+|---|---|
+| `/v1/chat/completions` (OpenAI Chat) | yes |
+| `/v1/responses` (OpenAI Responses) | yes |
+| anything else (`/v1/messages`, `/v1/completions`, `/embeddings`, `/health`, ...) | passthrough |
+
+**Why the two are the same thing**: llama.cpp converts Responses into its internal chat form
+itself (`server_chat_convert_responses_to_chatcmpl`), and all three endpoints end up in the same
+`handle_completions_impl`. Prompt rendering, the slot, the context checkpoints and the
+`--slot-save-path` save/restore are therefore shared; the proxy only has to read two things out of
+a differently shaped JSON body — the system text and a message count.
+
+⚠️ Anthropic's `/v1/messages` is **not** cached (llama.cpp supports it natively too). If your
+client uses it the proxy still serves it correctly, just without the speedup — adding it is the
+same exercise if you want it.
+
+⚠️ Responses input must use the Responses shape (typed items):
+
+```json
+{"instructions": "You are a helpful assistant.",
+ "input": [{"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "hi"}]}]}
+```
+
+Also note **`previous_response_id` is not supported by llama.cpp**, so the client must resend the
+whole `input` each turn (DSH does exactly that).
+
 ## Requirements
 
 * A llama.cpp build with the `--slot-save-path` option and the `/slots?action=save|restore`

@@ -266,9 +266,11 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Only /v1/chat/completions is eligible for caching. Everything else
-	// (health, props, models, tokenize, embeddings, ...) is a plain passthrough.
-	if r.URL.Path != "/v1/chat/completions" || r.Method != http.MethodPost {
+	// /v1/chat/completions and /v1/responses are eligible. llama.cpp converts
+	// Responses to the same internal chat form, so the slot, the checkpoints and
+	// the save/restore path are identical. Everything else is a plain passthrough.
+	if (r.URL.Path != "/v1/chat/completions" && r.URL.Path != "/v1/responses") ||
+		r.Method != http.MethodPost {
 		p.passthrough(w, r, start, nil)
 		return
 	}
@@ -426,6 +428,10 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request) {
 
 // parseRequest extracts the cache key material. It never modifies the body.
 func (p *Proxy) parseRequest(r *http.Request, body []byte) (*reqInfo, error) {
+	if r.URL.Path == "/v1/responses" {
+		return p.parseResponses(r, body)
+	}
+
 	var doc struct {
 		Messages []struct {
 			Role    string          `json:"role"`
@@ -441,39 +447,108 @@ func (p *Proxy) parseRequest(r *http.Request, body []byte) (*reqInfo, error) {
 		return nil, fmt.Errorf("no leading system message")
 	}
 
-	// DSH sends `Session_id`. Without any session id the proxy still works —
-	// it just cannot recognize a returning conversation, so the session
-	// snapshot path stays unused and only the seed path applies.
-	session := strings.TrimSpace(r.Header.Get(p.cfg.SessionHeader))
-	if session == "" {
-		session = strings.TrimSpace(r.Header.Get("X-Client-Request-Id"))
-	}
-
 	sys := rawToString(doc.Messages[0].Content)
 
-	// The key must cover the MODEL, the system message and the tools.
-	// - tools render inside the system message, so they change the prefix;
-	// - the model identity is not recorded in a state file at all (llama.cpp
-	//   stores only the architecture name), so without it a restart on a
-	//   different same-architecture model would silently reuse the old KV.
-	// See model.go.
-	h := sha256.New()
-	h.Write([]byte(p.modelID()))
-	h.Write([]byte{0})
-	h.Write([]byte(sys))
-	h.Write([]byte{0})
-	h.Write(bytes.TrimSpace(doc.Tools))
-	key := hex.EncodeToString(h.Sum(nil))[:16]
-
 	return &reqInfo{
-		Session: sanitize(session),
-		Key:     key,
+		Session: sanitize(sessionOf(r, p.cfg.SessionHeader)),
+		Key:     p.keyOf(sys, doc.Tools),
 		System:  sys,
 		Tools:   doc.Tools,
 		Body:    body,
 		IsChat:  true,
 		Stream:  doc.Stream,
 		NMsgs:   len(doc.Messages),
+	}, nil
+}
+
+// sessionOf returns the session identity. Without one the proxy still works —
+// it just cannot recognize a returning conversation, so the session snapshot
+// path stays unused and only the seed path applies.
+func sessionOf(r *http.Request, header string) string {
+	if v := strings.TrimSpace(r.Header.Get(header)); v != "" {
+		return v
+	}
+	return strings.TrimSpace(r.Header.Get("X-Client-Request-Id"))
+}
+
+// keyOf is the cache key. It must cover the MODEL, the system message and the
+// tools:
+//   - tools render inside the system message, so they change the prefix;
+//   - the model identity is not recorded in a state file at all (llama.cpp
+//     stores only the architecture name), so without it a restart on a
+//     different same-architecture model would silently reuse the old KV.
+//
+// See model.go.
+func (p *Proxy) keyOf(sys string, tools json.RawMessage) string {
+	h := sha256.New()
+	h.Write([]byte(p.modelID()))
+	h.Write([]byte{0})
+	h.Write([]byte(sys))
+	h.Write([]byte{0})
+	h.Write(bytes.TrimSpace(tools))
+	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+// parseResponses reads the OpenAI Responses shape (/v1/responses). Only what the
+// cache needs is understood; the body is forwarded untouched.
+//
+// llama.cpp converts Responses to its internal chat form itself
+// (server_chat_convert_responses_to_chatcmpl), so nothing about the slot or the
+// save/restore path differs. Two things are needed here: the system text (to
+// build and key the seed) and a message count (for the prefix guard).
+func (p *Proxy) parseResponses(r *http.Request, body []byte) (*reqInfo, error) {
+	var doc struct {
+		Instructions json.RawMessage `json:"instructions"`
+		Input        json.RawMessage `json:"input"`
+		Tools        json.RawMessage `json:"tools"`
+		Stream       bool            `json:"stream"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, err
+	}
+	if len(doc.Input) == 0 {
+		return nil, fmt.Errorf("no input")
+	}
+
+	// `instructions` renders as a leading system turn.
+	sys := rawToString(doc.Instructions)
+	n := 0
+	if sys != "" {
+		n++
+	}
+
+	// `input` is either a plain string (one user turn) or a list of items.
+	var items []struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(doc.Input, &items); err == nil {
+		n += len(items)
+		if sys == "" {
+			// A system/developer item does the same job as `instructions`.
+			for _, it := range items {
+				if it.Role == "system" || it.Role == "developer" {
+					sys = rawToString(it.Content)
+					break
+				}
+			}
+		}
+	} else {
+		n++
+	}
+	if sys == "" {
+		return nil, fmt.Errorf("no instructions or system item")
+	}
+
+	return &reqInfo{
+		Session: sanitize(sessionOf(r, p.cfg.SessionHeader)),
+		Key:     p.keyOf(sys, doc.Tools),
+		System:  sys,
+		Tools:   doc.Tools,
+		Body:    body,
+		IsChat:  true,
+		Stream:  doc.Stream,
+		NMsgs:   n,
 	}, nil
 }
 
@@ -655,8 +730,24 @@ func (t *tailBuffer) Write(p []byte) (int, error) {
 
 // cacheN/promptN dig the usage numbers out of the tail of an SSE stream or a
 // plain JSON body. Absent values yield 0.
-func (t *tailBuffer) cacheN() int64  { return t.num("cache_n") }
-func (t *tailBuffer) promptN() int64 { return t.num("prompt_n") }
+// cacheN is the tokens the server reused. chat/completions reports `timings`,
+// Responses reports `usage` — never both, so trying them in turn is enough.
+func (t *tailBuffer) cacheN() int64 {
+	if n := t.num("cache_n"); n > 0 {
+		return n
+	}
+	return t.num("cached_tokens")
+}
+
+func (t *tailBuffer) promptN() int64 {
+	if n := t.num("prompt_n"); n > 0 {
+		return n
+	}
+	if n := t.num("input_tokens"); n > 0 {
+		return n - t.num("cached_tokens")
+	}
+	return 0
+}
 
 func (t *tailBuffer) num(field string) int64 {
 	i := bytes.LastIndex(t.buf, []byte(`"`+field+`":`))

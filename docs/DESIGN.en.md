@@ -307,7 +307,58 @@ The fingerprint is re-checked every 60 seconds, so a model swap needs no proxy r
 re-check (the server is not up yet) logs one WARN; keys omit the fingerprint until it succeeds, then
 converge on their own.
 
-## 12. Forwarding must flush per chunk
+## 12. Endpoint adaptation: Responses is a thin layer
+
+The proxy caches both `/v1/chat/completions` and `/v1/responses`. **This is not two mechanisms** —
+in llama.cpp's `server.cpp` route table all three endpoints become chatcmpl first:
+
+```
+/v1/chat/completions →                                 oaicompat_chat_params_parse → handle_completions_impl
+/v1/responses        → server_chat_convert_responses_to_chatcmpl → oaicompat_chat_params_parse → handle_completions_impl
+/v1/messages         → server_chat_convert_anthropic_to_oai       → oaicompat_chat_params_parse → handle_completions_impl
+```
+
+Prompt rendering, the slot, the context checkpoints and the `--slot-save-path` save/restore are
+therefore all shared. Upstream's conversion functions are 291 lines (Responses) and 272
+(Anthropic) **because they cover the whole specification**: images, files, tool calls,
+`function_call_output`, refusals, ...
+
+**The proxy needs two things**: the `system` text (to build and key the seed) and a **message
+count** (the prefix guard). So the adaptation layer is ~70 lines — one `parseResponses`, factoring
+`sessionOf`/`keyOf` out for reuse, and reading the counters (Responses reports `usage`, never
+`timings`).
+
+⚠️ **One upstream quirk worth recording**: an input reasoning item **must carry a `summary`
+array** to be accepted:
+
+```cpp
+} else if (exists_and_is_array(item, "summary") &&
+           exists_and_is_string(item, "type") &&
+           item.at("type") == "reasoning") {
+```
+
+`content` without `summary` ⇒ **400 `Cannot determine type of 'item'`**. llama.cpp puts
+`"summary": []` in its own responses, so verbatim resending works; a client that constructs the
+reasoning item itself will trip over it.
+
+**Measured (reasoning model, so `max_output_tokens` was entirely consumed by reasoning)**:
+
+| Step | input_tokens | cached_tokens | wall |
+|---|---|---|---|
+| A turn 1 (cold) | 778 | 766 | 1.2 s |
+| A turn 2 | 1,010 | 805 | 3.2 s |
+| switch to B | 775 | 766 | 2.6 s |
+| **back to A (snapshot restore)** | 1,259 | **1,055** | 2.6 s |
+| **back to B (snapshot restore)** | 1,032 | **822** | 3.3 s |
+| same instance, `/v1/chat/completions` | — | `cache_n=766` | 0.7 s |
+
+⚠️ **Testing this failed three times in a row, always for the same reason**: the generated
+**reasoning was not echoed back**. A snapshot holds generated tokens, so dropping a stretch of the
+prefix breaks it — nothing to do with the endpoint, it is the client contract of section 1.
+**Lesson: verification of a new endpoint has to simulate full echoing, or it tests a scenario of
+your own making.**
+
+## 13. Forwarding must flush per chunk
 
 `forward()` copies the response body by hand and calls `Flush()` after **every chunk**. The original
 single `io.Copy` plus one trailing flush made streaming useless: data waited for Go's response
@@ -326,7 +377,7 @@ The first row is a short answer with no streaming at all: under 2 KB, so the buf
 The second is roughly 90 ms of added first-token latency at a realistic size, plus a visible stall
 every ~2 KB.
 
-## 13. Slot ownership fails on two paths
+## 14. Slot ownership fails on two paths
 
 "Already resident ⇒ forward directly" is the highest-value decision, so it is also the most costly
 to get wrong: it **skips a restore that would have worked**. Both paths are fixed.
@@ -349,7 +400,7 @@ request looked "resident" ⇒ its snapshot restore was skipped and everything wa
 recording code read `up.cacheN` directly ⇒ panic. The client got a reset connection rather than a
 502 (measured `HTTP=000`). Fix: return early on nil and count it in `upstream_errors`.
 
-## 14. Deliberate non-goals
+## 15. Deliberate non-goals
 
 * **No request rewriting.** The proxy restores and then forwards the body
   untouched. This is what makes a cache failure a performance event rather than

@@ -265,7 +265,53 @@ if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) { ... 
 指纹每 60 秒复核一次，因此换模型后无需重启代理；复核失败（上游还没起来）只记一条 WARN，
 期间的键不含模型指纹，恢复正常后自动收敛。
 
-## 12. 转发必须逐块 flush
+## 12. 接口适配：Responses 是薄薄一层
+
+代理缓存 `/v1/chat/completions` 与 `/v1/responses` 两个端点。**这不是两套机制** ——
+llama.cpp 的 `server.cpp` 路由表里三条接口都先转成 chatcmpl：
+
+```
+/v1/chat/completions →                                 oaicompat_chat_params_parse → handle_completions_impl
+/v1/responses        → server_chat_convert_responses_to_chatcmpl → oaicompat_chat_params_parse → handle_completions_impl
+/v1/messages         → server_chat_convert_anthropic_to_oai       → oaicompat_chat_params_parse → handle_completions_impl
+```
+
+⇒ **提示词渲染、槽位、上下文检查点、`--slot-save-path` 的 save/restore 全部共用**。
+上游那个转换函数有 291 行（Responses）与 272 行（Anthropic），**因为它要处理完整规格**：
+图片、文件、工具调用、`function_call_output`、refusal…
+
+**代理只需要两样东西**：`system` 文本（建种子 + 算 key）与**消息条数**（前缀守卫）。
+所以适配层只有约 70 行 —— 一个 `parseResponses`、把 `sessionOf`/`keyOf` 抽出来共用，
+外加统计字段的读取（Responses 报 `usage`，没有 `timings`）。
+
+⚠️ **一个上游怪癖值得记下**：输入侧的 reasoning item **必须带 `summary` 数组**才被接受：
+
+```cpp
+} else if (exists_and_is_array(item, "summary") &&
+           exists_and_is_string(item, "type") &&
+           item.at("type") == "reasoning") {
+```
+
+只有 `content` 而没有 `summary` ⇒ **400 `Cannot determine type of 'item'`**。
+响应里 llama.cpp 自己会带上 `"summary": []`，所以**原样回传**可行；但客户端自己构造
+reasoning item 时容易踩。
+
+**实测（推理模型，`max_output_tokens` 全被 reasoning 吃掉）**：
+
+| 步骤 | input_tokens | cached_tokens | 墙钟 |
+|---|---|---|---|
+| A 第 1 轮（冷） | 778 | 766 | 1.2 s |
+| A 第 2 轮 | 1,010 | 805 | 3.2 s |
+| 切到 B | 775 | 766 | 2.6 s |
+| **切回 A（快照恢复）** | 1,259 | **1,055** | 2.6 s |
+| **再切回 B（快照恢复）** | 1,032 | **822** | 3.3 s |
+| 同实例 `/v1/chat/completions` 无回归 | — | `cache_n=766` | 0.7 s |
+
+⚠️ **测这个功能时我连续失败三次，全部栽在同一件事上**：没把模型生成的 **reasoning 回显回去**。
+快照含生成 token，少回显一段前缀就断 —— 与接口无关，是客户端契约（第 1 节的前缀律）。
+**教训：新端点的验证必须模拟「完整回显」，否则测的是自己造的错误场景。**
+
+## 13. 转发必须逐块 flush
 
 `forward()` 手工拷贝响应体并在**每个 chunk 之后** `Flush()`。最初用的是一次 `io.Copy`
 加末尾一次 flush，那会让流式形同虚设 —— 数据要等 Go 的响应缓冲凑满才会下发，
@@ -281,7 +327,7 @@ if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) { ... 
 第一行是「短回答完全没有流式」：总量不到 2 KB，缓冲区直到结束都没满。第二行是真实规模下
 约 90 ms 的额外首字延迟，以及每约 2 KB 一次的可见停顿。
 
-## 13. 槽位归属会在两条路径上失效
+## 14. 槽位归属会在两条路径上失效
 
 「已常驻 ⇒ 直接转发」是收益最高的判定，因此它出错时代价也最大：会**跳过本来能命中的恢复**。
 两处都已修：
@@ -300,7 +346,7 @@ opencode 先发一个 2 KB system 的标题请求再发真正那个。它们共�
 `up.cacheN` ⇒ panic。客户端拿到的不是 502 而是连接被重置（实测 `HTTP=000`）。
 修法：nil 提前返回并计入 `upstream_errors`。
 
-## 14. 刻意不做的事
+## 15. 刻意不做的事
 
 * **不改写请求。** 代理先恢复，然后把请求体原样转发。
   正因如此，缓存失败只是一次性能事件，而不是一次正确性事件。
